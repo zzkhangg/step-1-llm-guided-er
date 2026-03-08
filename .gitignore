@@ -1,0 +1,6 @@
+datasets/
+*.pth
+.env
+cache
+__pycache__
+.vscode
