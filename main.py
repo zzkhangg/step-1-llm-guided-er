@@ -1,29 +1,56 @@
 from loader import load_data
-from manual_inspection.filter import filter_attributes
+from attribute_selection.manual import manual_selection
+from attribute_selection.heuristics import heuristic_selection
+from attribute_selection.llm_guided import llm_guided_selection
 import os
 import gensim.downloader as api
 import numpy as np
-from embeddings import record_to_vector
+from embeddings.embeddings import record_to_vector
 from sklearn.preprocessing import normalize
-from blocking import create_random_planes, query_lsh_fast
+from blocking.lsh import create_random_planes, query_lsh_fast
 from constants import *
-from matcher import infer_candidates_batch, infer_pairs_batch
+from matcher.matcher import infer_candidates_pairwise
+from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
+from utils import build_id_maps, build_gt_set
+# -----------------------------
+# CONFIG
+# -----------------------------
+SELECTION_METHOD = "manual"
+# options: manual, heuristic, supervised
 
-# Load pre-trained GloVe embeddings
-glove = api.load("glove-wiki-gigaword-300")  # 300-dimensional embeddings
-np.random.seed(42) ## for reproducibility
-
+# -----------------------------
+# Load data
+# -----------------------------
 df_A = load_data(os.path.join(BASE_PATH, "tableA.csv"))
 df_B = load_data(os.path.join(BASE_PATH, "tableB.csv"))
 df_gt = load_data(os.path.join(BASE_PATH, "gold.csv"))
 
 print(df_A.shape)
 print(df_B.shape)
-print(df_A.index.tolist()[:5])   # should be [0, 1, 2, 3, 4]
-print(df_gt['ltable_id'].head())  # should also start from 0
 
-df_A = filter_attributes(df_A, MARKERS_ATTRIBUTES)
-df_B = filter_attributes(df_B, MARKERS_ATTRIBUTES)
+# Build ID → position maps
+idA_to_pos , idB_to_pos = build_id_maps(df_A, df_B, 'id', 'id')
+
+# -----------------------------
+# Attribute selection
+# -----------------------------
+if SELECTION_METHOD == "manual":
+    df_A, df_B = manual_selection(df_A, df_B)
+
+elif SELECTION_METHOD == "heuristic":
+    df_A, df_B = heuristic_selection(df_A, df_B)
+
+elif SELECTION_METHOD == "supervised":
+    df_A, df_B = llm_guided_selection(df_A, df_B, df_gt)
+
+print("Selection method:", SELECTION_METHOD)
+print("Attributes used:", df_A.columns.tolist())
+
+# -----------------------------
+# Embeddings
+# -----------------------------
+glove = api.load("glove-wiki-gigaword-300")
+np.random.seed(42)
 
 tableA_vectors = np.vstack([
     record_to_vector(row, glove)
@@ -60,29 +87,82 @@ reduction_percentage = (total_pairs - candidate_pairs_count) / total_pairs * 100
 
 print(f"Reduction percentage: {reduction_percentage:.2f}%")
 
-# assuming you have ground truth as list of (idA, idB) tuples
-gt = list(zip(df_gt['ltable_id'], df_gt['rtable_id']))
+# Convert ground truth to positional indices
+gt_set = build_gt_set(df_gt, idA_to_pos, idB_to_pos, 'ltable_id', 'rtable_id')
+
 cand_set = set(candidate_pairs)
-found = sum(1 for pair in gt if pair in cand_set)
-pc = found / len(gt)
-print(f"True matches:      {len(gt)}")
+found = sum(1 for pair in gt_set if pair in cand_set)
+pc = found / len(gt_set)
+print(f"True matches:      {len(gt_set)}")
 print(f"Found in blocking: {found}")
 print(f"Pair Completeness: {pc:.4f}")
 print(f"Candidates:        {len(candidate_pairs)}")
 
-missed = [(a, b) for a, b in gt if (a, b) not in cand_set]
-for idx_a, idx_b in missed[:10]:
-    print("A:", df_A.iloc[idx_a][MARKERS_ATTRIBUTES].tolist())
-    print("B:", df_B.iloc[idx_b][MARKERS_ATTRIBUTES].tolist())
-    print()
+# ---------------------------------------
+# Call LLM for candidate pairs
+# ---------------------------------------
+# You can adjust max_workers based on API rate limits
+
+result_df = infer_candidates_pairwise(df_A, df_B, candidate_pairs)
+
+print(f"Total pairs checked by LLM: {len(result_df)}")
+
+# Inference 
+
+# Find pairs missed at blocking stage
+blocking_misses = [(a, b) for a, b in gt_set if (a, b) not in cand_set]
+print(f"Blocking misses: {len(blocking_misses)}")
+for idx_a, idx_b in blocking_misses[:5]:
+    print("\n--- Missed at Blocking ---")
+    print("A:", df_A.iloc[idx_a].to_dict())
+    print("B:", df_B.iloc[idx_b].to_dict())
+
+# Find pairs missed at LLM stage (in candidates but LLM said No)
+llm_misses = []
+for _, row in result_df.iterrows():
+    i, j = int(row['indexA']), int(row['indexB'])
+    if (i, j) in gt_set and row['answer'] == 'No':
+        llm_misses.append((i, j))
+
+print(f"\nLLM misses: {len(llm_misses)}")
+for idx_a, idx_b in llm_misses:
+    print("\n--- Missed at LLM ---")
+    print("A:", df_A.iloc[idx_a].to_dict())
+    print("B:", df_B.iloc[idx_b].to_dict())
 
 # # ---------------------------------------
-# # Call LLM for candidate pairs
+# # Align result_df with ground truth
 # # ---------------------------------------
-# # You can adjust max_workers based on API rate limits
-# max_workers = 16  
 
-# result_df = infer_candidates_concurrent(df_A, df_B, candidate_pairs, max_workers=max_workers)
+# # Map predictions to binary labels
+# y_pred = []
+# y_true = []
 
-# print(result_df.head())
-# print(f"Total pairs checked by LLM: {len(result_df)}")
+# for _, row in result_df.iterrows():
+#     i, j = int(row['indexA']), int(row['indexB'])
+#     y_pred.append(1 if row['answer'] == 'Yes' else 0)
+#     y_true.append(1 if (i, j) in gt_set else 0)
+
+# # ---------------------------------------
+# # Metrics
+# # ---------------------------------------
+# precision = precision_score(y_true, y_pred, zero_division=0)
+# recall    = recall_score(y_true, y_pred, zero_division=0)
+# f1        = f1_score(y_true, y_pred, zero_division=0)
+# tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+
+# print(f"TP: {tp} | FP: {fp} | TN: {tn} | FN: {fn}")
+# print(f"Precision : {precision:.4f}")
+# print(f"Recall    : {recall:.4f}")
+# print(f"F1 Score  : {f1:.4f}")
+
+# # ---------------------------------------
+# # How many true matches were in candidates vs found by LLM
+# # ---------------------------------------
+# cand_set  = set(zip(result_df['indexA'], result_df['indexB']))
+# in_cands  = sum(1 for pair in gt_set if pair in cand_set)
+# found_llm = tp
+
+# print(f"\nTrue matches total         : {len(gt_set)}")
+# print(f"True matches in candidates : {in_cands}  (blocking recall)")
+# print(f"True matches found by LLM  : {found_llm}  (end-to-end recall)")

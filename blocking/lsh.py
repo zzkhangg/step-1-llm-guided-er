@@ -1,6 +1,12 @@
 from collections import defaultdict
 import numpy as np
 
+
+# LSH parameters
+num_tables = 15
+num_planes = 6
+
+
 def create_random_planes(num_tables: int, num_planes: int, dim: int):
     planes = []
     for _ in range(num_tables):

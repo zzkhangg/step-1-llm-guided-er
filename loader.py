@@ -1,10 +1,11 @@
 import pandas as pd
 
-def load_data(file_path):
+def load_data(file_path, encoding='utf-8'):
     try:
-        df = pd.read_csv(file_path, sep=None, engine='python')
+        df = pd.read_csv(file_path, sep=None, engine='python',encoding=encoding)
 
     except Exception as e:
-        return f"Error reading file with pandas: {e}"
+        print(f"Error reading file: {e}")
+        return None
     
     return df
