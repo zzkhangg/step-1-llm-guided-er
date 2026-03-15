@@ -25,7 +25,7 @@ if not API_KEY:
 
 client = OpenAI(api_key=API_KEY)
 
-CACHE_DIR = Path("cache/Fodors-Zagat")
+CACHE_DIR = Path("cache/DBLP-ACM")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------

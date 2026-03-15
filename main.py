@@ -15,8 +15,11 @@ from utils import build_id_maps, build_gt_set
 # -----------------------------
 # CONFIG
 # -----------------------------
-SELECTION_METHOD = "manual"
+SELECTION_METHOD = "heuristic"
 # options: manual, heuristic, supervised
+
+ID_A = "id"
+ID_B = "id"
 
 # -----------------------------
 # Load data
@@ -27,9 +30,10 @@ df_gt = load_data(os.path.join(BASE_PATH, "gold.csv"))
 
 print(df_A.shape)
 print(df_B.shape)
-
 # Build ID → position maps
-idA_to_pos , idB_to_pos = build_id_maps(df_A, df_B, 'id', 'id')
+idA_to_pos , idB_to_pos = build_id_maps(df_A, df_B, ID_A, ID_B)
+df_A = df_A.drop(columns=[ID_A])
+df_B = df_B.drop(columns=[ID_B])
 
 # -----------------------------
 # Attribute selection
@@ -109,60 +113,60 @@ print(f"Total pairs checked by LLM: {len(result_df)}")
 
 # Inference 
 
-# Find pairs missed at blocking stage
-blocking_misses = [(a, b) for a, b in gt_set if (a, b) not in cand_set]
-print(f"Blocking misses: {len(blocking_misses)}")
-for idx_a, idx_b in blocking_misses[:5]:
-    print("\n--- Missed at Blocking ---")
-    print("A:", df_A.iloc[idx_a].to_dict())
-    print("B:", df_B.iloc[idx_b].to_dict())
+# # Find pairs missed at blocking stage
+# blocking_misses = [(a, b) for a, b in gt_set if (a, b) not in cand_set]
+# print(f"Blocking misses: {len(blocking_misses)}")
+# for idx_a, idx_b in blocking_misses[:5]:
+#     print("\n--- Missed at Blocking ---")
+#     print("A:", df_A.iloc[idx_a].to_dict())
+#     print("B:", df_B.iloc[idx_b].to_dict())
 
-# Find pairs missed at LLM stage (in candidates but LLM said No)
-llm_misses = []
-for _, row in result_df.iterrows():
-    i, j = int(row['indexA']), int(row['indexB'])
-    if (i, j) in gt_set and row['answer'] == 'No':
-        llm_misses.append((i, j))
-
-print(f"\nLLM misses: {len(llm_misses)}")
-for idx_a, idx_b in llm_misses:
-    print("\n--- Missed at LLM ---")
-    print("A:", df_A.iloc[idx_a].to_dict())
-    print("B:", df_B.iloc[idx_b].to_dict())
-
-# # ---------------------------------------
-# # Align result_df with ground truth
-# # ---------------------------------------
-
-# # Map predictions to binary labels
-# y_pred = []
-# y_true = []
-
+# # Find pairs missed at LLM stage (in candidates but LLM said No)
+# llm_misses = []
 # for _, row in result_df.iterrows():
 #     i, j = int(row['indexA']), int(row['indexB'])
-#     y_pred.append(1 if row['answer'] == 'Yes' else 0)
-#     y_true.append(1 if (i, j) in gt_set else 0)
+#     if (i, j) in gt_set and row['answer'] == 'No':
+#         llm_misses.append((i, j))
 
-# # ---------------------------------------
-# # Metrics
-# # ---------------------------------------
-# precision = precision_score(y_true, y_pred, zero_division=0)
-# recall    = recall_score(y_true, y_pred, zero_division=0)
-# f1        = f1_score(y_true, y_pred, zero_division=0)
-# tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+# print(f"\nLLM misses: {len(llm_misses)}")
+# for idx_a, idx_b in llm_misses:
+#     print("\n--- Missed at LLM ---")
+#     print("A:", df_A.iloc[idx_a].to_dict())
+#     print("B:", df_B.iloc[idx_b].to_dict())
 
-# print(f"TP: {tp} | FP: {fp} | TN: {tn} | FN: {fn}")
-# print(f"Precision : {precision:.4f}")
-# print(f"Recall    : {recall:.4f}")
-# print(f"F1 Score  : {f1:.4f}")
+# ---------------------------------------
+# Align result_df with ground truth
+# ---------------------------------------
 
-# # ---------------------------------------
-# # How many true matches were in candidates vs found by LLM
-# # ---------------------------------------
-# cand_set  = set(zip(result_df['indexA'], result_df['indexB']))
-# in_cands  = sum(1 for pair in gt_set if pair in cand_set)
-# found_llm = tp
+# Map predictions to binary labels
+y_pred = []
+y_true = []
 
-# print(f"\nTrue matches total         : {len(gt_set)}")
-# print(f"True matches in candidates : {in_cands}  (blocking recall)")
-# print(f"True matches found by LLM  : {found_llm}  (end-to-end recall)")
+for _, row in result_df.iterrows():
+    i, j = int(row['indexA']), int(row['indexB'])
+    y_pred.append(1 if row['answer'] == 'Yes' else 0)
+    y_true.append(1 if (i, j) in gt_set else 0)
+
+# ---------------------------------------
+# Metrics
+# ---------------------------------------
+precision = precision_score(y_true, y_pred, zero_division=0)
+recall    = recall_score(y_true, y_pred, zero_division=0)
+f1        = f1_score(y_true, y_pred, zero_division=0)
+tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+
+print(f"TP: {tp} | FP: {fp} | TN: {tn} | FN: {fn}")
+print(f"Precision : {precision:.4f}")
+print(f"Recall    : {recall:.4f}")
+print(f"F1 Score  : {f1:.4f}")
+
+# ---------------------------------------
+# How many true matches were in candidates vs found by LLM
+# ---------------------------------------
+cand_set  = set(zip(result_df['indexA'], result_df['indexB']))
+in_cands  = sum(1 for pair in gt_set if pair in cand_set)
+found_llm = tp
+
+print(f"\nTrue matches total         : {len(gt_set)}")
+print(f"True matches in candidates : {in_cands}  (blocking recall)")
+print(f"True matches found by LLM  : {found_llm}  (end-to-end recall)")
