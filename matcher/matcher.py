@@ -50,6 +50,28 @@ def save_to_cache(pair_hash, data):
 # ---------------------------------------
 # Single pairwise API call
 # ---------------------------------------
+
+def preview_prompt(df_A, df_B, candidate_pairs, n=5):
+    """
+    Preview the first n prompts that will be sent to the LLM.
+    
+    Parameters
+    ----------
+    df_A, df_B       : DataFrames
+    candidate_pairs  : list of (idxA, idxB) tuples
+    n                : number of prompts to preview
+    """
+    for idx, (i, j) in enumerate(candidate_pairs[:n]):
+        recA = df_A.iloc[i].to_dict()
+        recB = df_B.iloc[j].to_dict()
+        prompt = PROMPT.replace("{record_a}", str(recA)).replace("{record_b}", str(recB))
+        
+        print(f"{'='*60}")
+        print(f"Pair {idx+1}: ({i}, {j})")
+        print(f"{'='*60}")
+        print(prompt)
+        print()
+
 def infer_pair(i, j, df_A, df_B):
     """
     Single API call for one record pair using the PROMPT template.
@@ -70,7 +92,9 @@ def infer_pair(i, j, df_A, df_B):
         }
 
     # Build prompt
-    prompt = PROMPT.format(record_a=recA, record_b=recB)
+    prompt = (PROMPT
+              .replace("{record_a}", str(recA))
+              .replace("{record_b}", str(recB)))
 
     # Single API call
     response = client.chat.completions.create(

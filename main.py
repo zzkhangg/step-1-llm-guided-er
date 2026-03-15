@@ -9,13 +9,13 @@ from embeddings.embeddings import record_to_vector
 from sklearn.preprocessing import normalize
 from blocking.lsh import create_random_planes, query_lsh_fast
 from constants import *
-from matcher.matcher import infer_candidates_pairwise
+from matcher.matcher import infer_candidates_pairwise, preview_prompt
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
 from utils import build_id_maps, build_gt_set
 # -----------------------------
 # CONFIG
 # -----------------------------
-SELECTION_METHOD = "heuristic"
+SELECTION_METHOD = "heuristics"
 # options: manual, heuristic, supervised
 
 ID_A = "id"
@@ -24,16 +24,16 @@ ID_B = "id"
 # -----------------------------
 # Load data
 # -----------------------------
-df_A = load_data(os.path.join(BASE_PATH, "tableA.csv"))
-df_B = load_data(os.path.join(BASE_PATH, "tableB.csv"))
-df_gt = load_data(os.path.join(BASE_PATH, "gold.csv"))
+df_A = load_data(os.path.join(BASE_PATH, "DBLP.csv"), encoding='latin1')
+df_B = load_data(os.path.join(BASE_PATH, "ACM.csv"), encoding='latin1')
+df_gt = load_data(os.path.join(BASE_PATH, "gold.csv"), encoding='latin1')
 
 print(df_A.shape)
 print(df_B.shape)
 # Build ID → position maps
 idA_to_pos , idB_to_pos = build_id_maps(df_A, df_B, ID_A, ID_B)
-df_A = df_A.drop(columns=[ID_A])
-df_B = df_B.drop(columns=[ID_B])
+df_A = df_A.drop(columns=[ID_A]).copy()
+df_B = df_B.drop(columns=[ID_B]).copy()
 
 # -----------------------------
 # Attribute selection
@@ -49,6 +49,7 @@ elif SELECTION_METHOD == "supervised":
 
 print("Selection method:", SELECTION_METHOD)
 print("Attributes used:", df_A.columns.tolist())
+# check the offending pair directly
 
 # -----------------------------
 # Embeddings
@@ -92,7 +93,7 @@ reduction_percentage = (total_pairs - candidate_pairs_count) / total_pairs * 100
 print(f"Reduction percentage: {reduction_percentage:.2f}%")
 
 # Convert ground truth to positional indices
-gt_set = build_gt_set(df_gt, idA_to_pos, idB_to_pos, 'ltable_id', 'rtable_id')
+gt_set = build_gt_set(df_gt, idA_to_pos, idB_to_pos, 'idDBLP', 'idACM')
 
 cand_set = set(candidate_pairs)
 found = sum(1 for pair in gt_set if pair in cand_set)
@@ -109,31 +110,20 @@ print(f"Candidates:        {len(candidate_pairs)}")
 
 result_df = infer_candidates_pairwise(df_A, df_B, candidate_pairs)
 
+fn_pairs = []
+for _, row in result_df.iterrows():
+    i, j = int(row['indexA']), int(row['indexB'])
+    if (i, j) in gt_set and row['answer'] == 'No':
+        fn_pairs.append((i, j))
+
+for i, j in fn_pairs[:10]:
+    print("\n--- LLM said No but should be Yes ---")
+    print("A:", df_A.iloc[i].to_dict())
+    print("B:", df_B.iloc[j].to_dict())
+
 print(f"Total pairs checked by LLM: {len(result_df)}")
 
 # Inference 
-
-# # Find pairs missed at blocking stage
-# blocking_misses = [(a, b) for a, b in gt_set if (a, b) not in cand_set]
-# print(f"Blocking misses: {len(blocking_misses)}")
-# for idx_a, idx_b in blocking_misses[:5]:
-#     print("\n--- Missed at Blocking ---")
-#     print("A:", df_A.iloc[idx_a].to_dict())
-#     print("B:", df_B.iloc[idx_b].to_dict())
-
-# # Find pairs missed at LLM stage (in candidates but LLM said No)
-# llm_misses = []
-# for _, row in result_df.iterrows():
-#     i, j = int(row['indexA']), int(row['indexB'])
-#     if (i, j) in gt_set and row['answer'] == 'No':
-#         llm_misses.append((i, j))
-
-# print(f"\nLLM misses: {len(llm_misses)}")
-# for idx_a, idx_b in llm_misses:
-#     print("\n--- Missed at LLM ---")
-#     print("A:", df_A.iloc[idx_a].to_dict())
-#     print("B:", df_B.iloc[idx_b].to_dict())
-
 # ---------------------------------------
 # Align result_df with ground truth
 # ---------------------------------------

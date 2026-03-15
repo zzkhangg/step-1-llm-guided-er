@@ -1,74 +1,86 @@
-from sklearn.feature_extraction.text import TfidfVectorizer
 import pandas as pd
+import re
 
-def prune_attributes(df, miss_thres=0.5, unique_thres=0.01):
-    missing_ratio = df.isnull().mean()
-    unique_ratio = df.nunique() / len(df)
-    keep = [
-        col for col in df.columns
-        if missing_ratio[col] < miss_thres
-        and unique_ratio[col] > unique_thres
-    ]
-    return df[keep]
+def prune_attributes(df_A, df_B, miss_thresh=0.5, unique_thresh=0.01):
+    cols = [c for c in df_A.columns if c in df_B.columns]
+    keep = []
+    for col in cols:
+        vals_A = df_A[col] if col in df_A.columns else pd.Series()
+        vals_B = df_B[col] if col in df_B.columns else pd.Series()
+        combined = pd.concat([vals_A, vals_B])
+        missing_ratio = combined.isnull().mean()
+
+        vals = combined.dropna()
+        n_unique = vals.nunique()
+        unique_ratio = n_unique / len(vals) if len(vals) > 0 else 0
+
+        # keep if: low missingness AND (reasonable unique ratio OR at least 2 unique values)
+        if missing_ratio < miss_thresh and unique_ratio > unique_thresh:
+            keep.append(col)
+        else:
+            print(f"[{col}] PRUNED — missing={missing_ratio:.3f}, "
+                  f"unique_ratio={unique_ratio:.4f}, n_unique={n_unique}")
+
+    print(f"Kept cols: {keep}")
+    return df_A[keep].copy(), df_B[keep].copy()
+
+# ── high-signal patterns to KEEP ──
+HIGH_SIGNAL_PATTERNS = [
+    r'\b\d{2,}\b',                                     # Numbers
+    r'\b[A-Z0-9]+(?:[-_][A-Z0-9]+)*\b',               # Codes/IDs
+    r'\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)*\b',            # Proper names / capitalized words
+    r'\b\d+\.?\d*\s*(?:kg|g|lb|lbs|oz|cm|mm|m|km|in|inch|inches|ft|l|ml|v|w|hz|ghz|mp)\b',  # Units
+    r'\b[a-z]{2,}\b',                                 # Generic lowercase words
+]
+
+BOILERPLATE_PATTERNS = [
+    r'http\S+',
+    r'www\.\S+',
+    r'\b(the|a|an|and|or|of|for|in|on|at|to|with|by|from|is|it|this|that|as)\b',
+    r'[^\w\s]',  # punctuation
+    r'\b(?:free|shipping|included|certified|refurbished|brand|item|product|please|note|click|here|more|details|information|features|description)\b'
+]
 
 
-def build_tfidf_compressor(df_A, df_B, cols, top_n=10, min_tokens=5):
+high_signal_regex = [re.compile(p, re.IGNORECASE) for p in HIGH_SIGNAL_PATTERNS]
+boilerplate_regex = [re.compile(p, re.IGNORECASE) for p in BOILERPLATE_PATTERNS]
+
+def compress_text(text: str, min_tokens: int = 10) -> str:
+    if not isinstance(text, str):
+        return ""
     
-    # pre-compute avg token length per column across both tables
-    col_avg_tokens = {}
-    for col in cols:
-        vals_A = df_A[col] if col in df_A.columns else pd.Series()
-        vals_B = df_B[col] if col in df_B.columns else pd.Series()
-        vals   = pd.concat([vals_A, vals_B]).dropna().astype(str)
-        col_avg_tokens[col] = vals.str.split().apply(len).mean()
-        print(f"[{col}] avg_tokens={col_avg_tokens[col]:.1f} → "
-              f"{'compress' if col_avg_tokens[col] > min_tokens else 'keep as-is'}")
+    tokens = text.strip().split()
+    
+    # skip compression for short values — already concise
+    if len(tokens) <= min_tokens:
+        return text.lower().strip()
 
-    # fit one TF-IDF per column
-    tfidf_per_col = {}
-    for col in cols:
-        if col_avg_tokens[col] <= min_tokens:
-            continue  # skip fitting TF-IDF for short columns — not needed
-        vals_A = df_A[col] if col in df_A.columns else pd.Series()
-        vals_B = df_B[col] if col in df_B.columns else pd.Series()
-        corpus = pd.concat([vals_A, vals_B]).fillna('').astype(str).str.lower().tolist()
-        tfidf  = TfidfVectorizer(token_pattern=r'\b\w{2,}\b', sublinear_tf=True,
-                                 min_df=2, max_df=0.95)
-        tfidf.fit(corpus)
-        vocab = tfidf.get_feature_names_out()
-        tfidf_per_col[col] = dict(zip(vocab, tfidf.idf_))
+    # remove boilerplate
+    cleaned = text
+    for pattern in boilerplate_regex:
+        cleaned = pattern.sub(" ", cleaned)
 
-    def compress_attribute(value, col):
-        if pd.isna(value) or str(value).strip() == '':
-            return ''
+    # extract high-signal tokens
+    seen, result = set(), []
+    for token in cleaned.split():
+        t_lower = token.lower().strip()
+        if not t_lower:
+            continue
+        if any(p.fullmatch(token) for p in high_signal_regex):
+            if t_lower not in seen:
+                seen.add(t_lower)
+                result.append(token)
 
-        # skip compression if column avg is short — keep entire value as-is
-        if col_avg_tokens.get(col, 0) <= min_tokens:
-            return str(value).lower().strip()
+    return " ".join(result) if result else cleaned.strip()
 
-        tokens = str(value).lower().split()
-        idf    = tfidf_per_col.get(col, {})
-        scored = [(token, idf.get(token, 0.0)) for token in tokens]
-
-        seen, kept = set(), []
-        for token, score in sorted(scored, key=lambda x: -x[1]):
-            if token not in seen:
-                seen.add(token)
-                kept.append(token)
-            if len(kept) >= top_n:
-                break
-        return ' '.join(kept)
-
-    return compress_attribute
-
-
+def compress_dataframe(df):
+    df = df.copy()
+    for col in df.columns:
+        df[col] = df[col].apply(compress_text)
+    return df
 def heuristic_selection(df_A, df_B):
-    df_A = prune_attributes(df_A)
-    df_B = prune_attributes(df_B)
-    cols = df_A.columns.tolist()
+    df_A, df_B = prune_attributes(df_A, df_B)
+    df_A = compress_dataframe(df_A)
+    df_B = compress_dataframe(df_B)
 
-    compress_attribute = build_tfidf_compressor(df_A, df_B, cols, top_n=10, min_tokens=5)
-    for col in cols:
-        df_A[col] = df_A[col].apply(lambda val: compress_attribute(val, col))
-        df_B[col] = df_B[col].apply(lambda val: compress_attribute(val, col))
     return df_A, df_B
