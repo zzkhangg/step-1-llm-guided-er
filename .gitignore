@@ -4,3 +4,4 @@ datasets/
 cache
 __pycache__
 .vscode
+*.pkl

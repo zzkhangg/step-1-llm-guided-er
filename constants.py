@@ -1,1 +1,1 @@
-BASE_PATH = "datasets/DBLP-ACM"
+BASE_PATH = "datasets/Amazon-Walmart"

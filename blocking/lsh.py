@@ -7,10 +7,11 @@ num_tables = 15
 num_planes = 6
 
 
-def create_random_planes(num_tables: int, num_planes: int, dim: int):
+def create_random_planes(num_tables: int, num_planes: int, dim: int, seed: int = 42):
+    rng = np.random.RandomState(seed)   # ← fixed seed, reproducible planes
     planes = []
     for _ in range(num_tables):
-        planes.append(np.random.randn(num_planes, dim))
+        planes.append(rng.randn(num_planes, dim))
     return planes
 
 

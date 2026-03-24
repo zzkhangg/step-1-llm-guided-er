@@ -25,7 +25,7 @@ if not API_KEY:
 
 client = OpenAI(api_key=API_KEY)
 
-CACHE_DIR = Path("cache/DBLP-ACM")
+CACHE_DIR = Path("cache/Amazon-Walmart")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------
@@ -47,31 +47,6 @@ def save_to_cache(pair_hash, data):
     with open(cache_file, "w") as f:
         json.dump(data, f, indent=2)
 
-# ---------------------------------------
-# Single pairwise API call
-# ---------------------------------------
-
-def preview_prompt(df_A, df_B, candidate_pairs, n=5):
-    """
-    Preview the first n prompts that will be sent to the LLM.
-    
-    Parameters
-    ----------
-    df_A, df_B       : DataFrames
-    candidate_pairs  : list of (idxA, idxB) tuples
-    n                : number of prompts to preview
-    """
-    for idx, (i, j) in enumerate(candidate_pairs[:n]):
-        recA = df_A.iloc[i].to_dict()
-        recB = df_B.iloc[j].to_dict()
-        prompt = PROMPT.replace("{record_a}", str(recA)).replace("{record_b}", str(recB))
-        
-        print(f"{'='*60}")
-        print(f"Pair {idx+1}: ({i}, {j})")
-        print(f"{'='*60}")
-        print(prompt)
-        print()
-
 def infer_pair(i, j, df_A, df_B):
     """
     Single API call for one record pair using the PROMPT template.
@@ -87,14 +62,14 @@ def infer_pair(i, j, df_A, df_B):
         return {
             "indexA": i,
             "indexB": j,
-            "answer": cached["answer"],
-            "input_tokens": cached["input_tokens"]
+            "answer": cached.get("answer"),   # fallback if missing
+            "input_tokens": cached.get("input_tokens")  # fallback
         }
 
     # Build prompt
     prompt = (PROMPT
-              .replace("{record_a}", str(recA))
-              .replace("{record_b}", str(recB)))
+          .replace("{record_a}", json.dumps(recA, ensure_ascii=False))
+          .replace("{record_b}", json.dumps(recB, ensure_ascii=False)))
 
     # Single API call
     response = client.chat.completions.create(
@@ -106,19 +81,27 @@ def infer_pair(i, j, df_A, df_B):
     content = response.choices[0].message.content.strip()
     answer  = "Yes" if content.lower().startswith("yes") else "No"
 
-    # Save to cache
-    save_to_cache(pair_hash, {
-        "prompt":       prompt,
-        "answer":       answer,
-        "input_tokens": response.usage.prompt_tokens
-    })
+    usage = response.usage
 
-    return {
-        "indexA":       i,
-        "indexB":       j,
-        "answer":       answer,
-        "input_tokens": response.usage.prompt_tokens
+    data = {
+        "prompt": prompt,
+        "answer": answer,
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens
     }
+
+    save_to_cache(pair_hash, data)
+
+    result = {
+        "indexA": i,
+        "indexB": j,
+        "answer": answer,
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens
+    }
+    return result
 
 # ---------------------------------------
 # Concurrent pairwise inference
