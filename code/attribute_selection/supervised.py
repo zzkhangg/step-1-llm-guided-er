@@ -6,7 +6,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report
 from difflib import SequenceMatcher
 
-from blocking.lsh import query_lsh_fast
+from ..lsh import query_lsh_fast
 
 
 # ── 1. Field-level similarity features ──

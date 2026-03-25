@@ -25,7 +25,7 @@ if not API_KEY:
 
 client = OpenAI(api_key=API_KEY)
 
-CACHE_DIR = Path("cache/Amazon-Walmart")
+CACHE_DIR = Path("cache/Fodors-Zagat")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------
@@ -63,7 +63,7 @@ def infer_pair(i, j, df_A, df_B):
             "indexA": i,
             "indexB": j,
             "answer": cached.get("answer"),   # fallback if missing
-            "input_tokens": cached.get("input_tokens")  # fallback
+            "prompt_tokens": cached.get("prompt_tokens")  # fallback
         }
 
     # Build prompt

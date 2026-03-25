@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import re
-from constants import *
+from .constants import *
 
 
 def preprocess(text):
@@ -24,9 +24,16 @@ def embed_text(tokens, embedding_model):
 def record_to_vector(row, embedding_model):
     vecs = []
     for val in row.values:
-        if pd.isna(val):
+        try:
+            is_empty = pd.isna(val) or str(val).strip() == ''
+        except:
+            is_empty = False
+
+        if is_empty:
             vec = np.zeros(embedding_model.vector_size)
         else:
-            vec = embed_text(preprocess(val), embedding_model)
+            vec = embed_text(preprocess(str(val)), embedding_model)
         vecs.append(vec)
-    return np.concatenate(vecs) if vecs else np.zeros(embedding_model.vector_size * len(MARKERS_ATTRIBUTES))
+
+    # use len(row) instead of hardcoded MARKERS_ATTRIBUTES
+    return np.concatenate(vecs) if vecs else np.zeros(embedding_model.vector_size * len(row))

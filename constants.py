@@ -1,1 +1,0 @@
-BASE_PATH = "datasets/Amazon-Walmart"

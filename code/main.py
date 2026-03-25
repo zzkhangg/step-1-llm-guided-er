@@ -1,15 +1,16 @@
 from loader import load_data
-from attribute_selection import manual_selection, llm_guided_selection, heuristic_selection, supervised_selection
 import os
 import gensim.downloader as api
 import numpy as np
-from embeddings.embeddings import record_to_vector
 from sklearn.preprocessing import normalize
-from blocking.lsh import create_random_planes, query_lsh_fast
-from constants import *
-from matcher.matcher import infer_candidates_pairwise, preview_prompt
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
-from utils import build_id_maps, build_gt_set
+
+from .constants import *
+from .embeddings import record_to_vector
+from .lsh import create_random_planes, query_lsh_fast
+from .matcher import infer_candidates_pairwise, preview_prompt
+from .utils import build_id_maps, build_gt_set
+from .attribute_selection import manual_selection, llm_guided_selection, heuristic_selection, supervised_selection
 # -----------------------------
 # CONFIG
 # -----------------------------
