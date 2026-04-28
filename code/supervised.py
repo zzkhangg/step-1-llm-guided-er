@@ -1,15 +1,13 @@
-from loader import load_data
 import os
 import gensim.downloader as api
 import numpy as np
 from sklearn.preprocessing import normalize
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
 
-
+from .loader import load_data
 from .attribute_selection import manual_selection, llm_guided_selection, heuristic_selection, supervised_selection
 from .embeddings import record_to_vector
 from .lsh import create_random_planes, query_lsh_fast
-from .constants import *
 from .matcher import infer_candidates_pairwise
 from .utils import build_id_maps, build_gt_set
 # -----------------------------
@@ -17,16 +15,16 @@ from .utils import build_id_maps, build_gt_set
 # -----------------------------
 SELECTION_METHOD = "supervised"
 # options: manual, heuristic, supervised, llm_guided
-
+BASE_PATH = "datasets/DBLP-ACM"
 ID_A = "id"
 ID_B = "id"
 
 # -----------------------------
 # Load data
 # -----------------------------
-df_A = load_data(os.path.join(BASE_PATH, "amazon.csv"))
-df_B = load_data(os.path.join(BASE_PATH, "walmart.csv"))
-df_gt = load_data(os.path.join(BASE_PATH, "gold.tsv"))
+df_A = load_data(os.path.join(BASE_PATH, "DBLP.csv"), encoding='latin1')
+df_B = load_data(os.path.join(BASE_PATH, "ACM.csv"), encoding='latin1')
+df_gt = load_data(os.path.join(BASE_PATH, "gold.csv"), encoding='latin1')
 
 print(df_A.shape)
 print(df_B.shape)
@@ -71,8 +69,8 @@ elif SELECTION_METHOD == "supervised":
         df_A=df_A,
         df_B=df_B,
         df_train=df_gt,        # your gold labels
-        id_col_A="id1",
-        id_col_B="id2",
+        id_col_A="idDBLP",
+        id_col_B="idACM",
         idA_to_pos=idA_to_pos,
         idB_to_pos=idB_to_pos,
         tableA_vectors=tableA_vectors,
@@ -128,7 +126,7 @@ reduction_percentage = (total_pairs - candidate_pairs_count) / total_pairs * 100
 print(f"Reduction percentage: {reduction_percentage:.2f}%")
 
 # Convert ground truth to positional indices
-gt_set = build_gt_set(df_gt, idA_to_pos, idB_to_pos, 'id1', 'id2')
+gt_set = build_gt_set(df_gt, idA_to_pos, idB_to_pos, 'idDBLP', 'idACM')
 
 cand_set = set(candidate_pairs)
 found = sum(1 for pair in gt_set if pair in cand_set)

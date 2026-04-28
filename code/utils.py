@@ -4,6 +4,29 @@ import numpy as np
 from pathlib import Path
 
 
+def compute_pc(candidate_pairs, gt_set):
+    """Compute Pair Completeness and Reduction Ratio."""
+    cand_set = set(candidate_pairs)
+    found    = sum(1 for pair in gt_set if pair in cand_set)
+    pc       = found / len(gt_set) if gt_set else 0.0
+    return pc, found
+
+def preprocess_df(df):
+    df = df.copy()
+
+    # Convert all values to string + handle NaN
+    df = df.fillna("").astype(str)
+
+    # Basic text normalization
+    for col in df.columns:
+        df[col] = (
+            df[col]
+            .str.lower()
+            .str.strip()
+        )
+
+    return df
+
 # ── 1. Generate and save negative pairs from LSH blocking ──
 
 def generate_negative_pairs(candidate_pairs, gt_set, save_path: str = None):

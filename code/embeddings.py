@@ -1,39 +1,36 @@
 import numpy as np
 import pandas as pd
 import re
-from .constants import *
+from sentence_transformers import SentenceTransformer
+from sklearn.preprocessing import normalize
 
+def embed_dataframe_sbert(df, model, batch_size=256):
+    """
+    Batch encode all values per column,
+    then concatenate column embeddings per record.
+    """
+    dim  = model.get_sentence_embedding_dimension()
+    cols = df.columns.tolist()
 
-def preprocess(text):
-    text = str(text).lower()
-    text = re.sub(r"[^a-z0-9\s]", "", text)
-    tokens = text.split()
-    return tokens
+    col_embeddings = {}
+    for col in cols:
+        texts = [
+            str(v).strip() if not pd.isna(v) and str(v).strip() != '' else ''
+            for v in df[col]
+        ]
+        # batch encode entire column at once
+        embeddings = model.encode(
+            texts,
+            batch_size=batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=False
+        )
+        # zero out empty values
+        for i, t in enumerate(texts):
+            if t == '':
+                embeddings[i] = np.zeros(dim)
+        col_embeddings[col] = embeddings
 
-def embed_text(tokens, embedding_model):
-    vecs = []
-    for token in tokens:
-        if token in embedding_model:
-            vecs.append(embedding_model[token])
-
-    if len(vecs) == 0:
-        return np.zeros(embedding_model.vector_size)
-
-    return np.mean(vecs, axis=0)
-
-def record_to_vector(row, embedding_model):
-    vecs = []
-    for val in row.values:
-        try:
-            is_empty = pd.isna(val) or str(val).strip() == ''
-        except:
-            is_empty = False
-
-        if is_empty:
-            vec = np.zeros(embedding_model.vector_size)
-        else:
-            vec = embed_text(preprocess(str(val)), embedding_model)
-        vecs.append(vec)
-
-    # use len(row) instead of hardcoded MARKERS_ATTRIBUTES
-    return np.concatenate(vecs) if vecs else np.zeros(embedding_model.vector_size * len(row))
+    # concatenate column vectors per record
+    return normalize(np.hstack([col_embeddings[col] for col in cols]))

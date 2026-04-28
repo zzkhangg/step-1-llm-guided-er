@@ -2,22 +2,12 @@ from collections import defaultdict
 import numpy as np
 
 
-# LSH parameters
-num_tables = 15
-num_planes = 6
-
-
 def create_random_planes(num_tables: int, num_planes: int, dim: int, seed: int = 42):
     rng = np.random.RandomState(seed)   # ← fixed seed, reproducible planes
     planes = []
     for _ in range(num_tables):
         planes.append(rng.randn(num_planes, dim))
     return planes
-
-
-def _bits_to_int(bits: np.ndarray) -> int:
-    """Convert binary array to integer for fast dict lookup."""
-    return int(''.join(bits.astype(str)), 2)
 
 
 def query_lsh_fast(tableA_vectors, tableB_vectors, planes_list, num_flips=1, top_k=5):

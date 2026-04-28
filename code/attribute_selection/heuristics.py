@@ -1,7 +1,7 @@
 import pandas as pd
 import re
 
-def prune_attributes(df_A, df_B, miss_thresh=0.5, unique_thresh=0.01):
+def prune_attributes(df_A, df_B, miss_thresh=0.5, unique_thresh=0.002):
     cols = [c for c in df_A.columns if c in df_B.columns]
     keep = []
     for col in cols:
@@ -14,7 +14,6 @@ def prune_attributes(df_A, df_B, miss_thresh=0.5, unique_thresh=0.01):
         n_unique = vals.nunique()
         unique_ratio = n_unique / len(vals) if len(vals) > 0 else 0
 
-        # keep if: low missingness AND (reasonable unique ratio OR at least 2 unique values)
         if missing_ratio < miss_thresh and unique_ratio > unique_thresh:
             keep.append(col)
         else:

@@ -1,13 +1,12 @@
 
 import os
-import gensim.downloader as api
+from sentence_transformers import SentenceTransformer
 import numpy as np
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
 from sklearn.preprocessing import normalize
 
 from .lsh import create_random_planes, query_lsh_fast
 from .utils import generate_negative_pairs, load_negative_pairs, build_labeled_pairs, build_id_maps, build_gt_set
-from .constants import *
 from .loader import load_data
 from .attribute_selection import manual_selection, llm_guided_selection, heuristic_selection, supervised_selection
 from .matcher import infer_candidates_pairwise
@@ -20,18 +19,18 @@ from .embeddings import record_to_vector
 # -----------------------------
 SELECTION_METHOD = "llm_guided"
 # options: manual, heuristic, supervised, llm_guided
-
+BASE_PATH = "datasets/DBLP-ACM"
 ID_A_COL = "id"
 ID_B_COL = "id"
-GT_ID_A_COL = 'ltable_id'
-GT_ID_B_COL = 'rtable_id'
+GT_ID_A_COL = 'idDBLP'
+GT_ID_B_COL = 'idACM'
 
 # -----------------------------
 # Load data
 # -----------------------------
-df_A = load_data(os.path.join(BASE_PATH, "tableA.csv"))
-df_B = load_data(os.path.join(BASE_PATH, "tableB.csv"))
-df_gt = load_data(os.path.join(BASE_PATH, "gold.csv"))
+df_A = load_data(os.path.join(BASE_PATH, "DBLP.csv"), encoding='latin1')
+df_B = load_data(os.path.join(BASE_PATH, "ACM.csv"), encoding='latin1')
+df_gt = load_data(os.path.join(BASE_PATH, "gold.csv"), encoding='latin1')
 
 print(df_A.shape)
 print(df_B.shape)
@@ -45,35 +44,33 @@ gt_set = build_gt_set(df_gt, idA_to_pos, idB_to_pos, GT_ID_A_COL, GT_ID_B_COL)
 # -----------------------------
 # Embeddings
 # -----------------------------
-glove = api.load("glove-wiki-gigaword-300")
-seed = np.random.seed(42) ### Reproducible
-
-tableA_vectors = np.vstack([
-    record_to_vector(row, glove)
-    for _, row in df_A.iterrows()
-])
-
-tableB_vectors = np.vstack([
-    record_to_vector(row, glove)
-    for _, row in df_B.iterrows()
-])
-
-tableA_vectors = normalize(tableA_vectors)
-tableB_vectors = normalize(tableB_vectors)
-
-print("TableA vectors shape:", tableA_vectors.shape)
-print("TableB vectors shape:", tableB_vectors.shape)
+model = SentenceTransformer('all-mpnet-base-v2')
+np.random.seed(42)
 
 NEGATIVES_PATH = os.path.join(BASE_PATH, "negatives.csv")
 
-# ── run blocking first ──
-planes_list     = create_random_planes(num_tables=15, num_planes=6, dim=tableA_vectors.shape[1], seed=seed)
-candidate_pairs = query_lsh_fast(tableA_vectors, tableB_vectors, planes_list,
-                                 num_flips=1, top_k=3)
-
-
 # ── generate and save negatives (only once) ──
 if not os.path.exists(NEGATIVES_PATH):
+    tableA_vectors = np.vstack([
+        record_to_vector(row, model)
+        for _, row in df_A.iterrows()
+    ])
+
+    tableB_vectors = np.vstack([
+        record_to_vector(row, model)
+        for _, row in df_B.iterrows()
+    ])
+
+    tableA_vectors = normalize(tableA_vectors)
+    tableB_vectors = normalize(tableB_vectors)
+
+    print("TableA vectors shape:", tableA_vectors.shape)
+    print("TableB vectors shape:", tableB_vectors.shape)
+
+    planes_list     = create_random_planes(num_tables=15, num_planes=6, dim=tableA_vectors.shape[1], seed=42)
+    candidate_pairs = query_lsh_fast(tableA_vectors, tableB_vectors, planes_list,
+                                 num_flips=1, top_k=3)
+
     df_negatives = generate_negative_pairs(candidate_pairs, gt_set,
                                            save_path=NEGATIVES_PATH)
 else:
@@ -91,17 +88,17 @@ labeled_pairs = build_labeled_pairs(
 df_A, df_B, ranked = llm_guided_selection(
     df_A, df_B, labeled_pairs=labeled_pairs,
     n_pos=10, n_neg=10,
-    threshold=0.3
+    threshold=0.8
 )
 
 # recompute embeddings AFTER selection
 tableA_vectors = np.vstack([
-    record_to_vector(row, glove)
+    record_to_vector(row, model)
     for _, row in df_A.iterrows()
 ])
 
 tableB_vectors = np.vstack([
-    record_to_vector(row, glove)
+    record_to_vector(row, model)
     for _, row in df_B.iterrows()
 ])
 

@@ -6,6 +6,7 @@ from openai import OpenAI
 import os
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import math
 
 PROMPT = (
     "You are an expert in data integration and entity resolution. "
@@ -47,13 +48,25 @@ def save_to_cache(pair_hash, data):
     with open(cache_file, "w") as f:
         json.dump(data, f, indent=2)
 
+
+def clean_record(rec):
+    cleaned = {}
+    for k, v in rec.items():
+        if v is None:
+            cleaned[k] = ""
+        elif isinstance(v, float) and math.isnan(v):
+            cleaned[k] = ""
+        else:
+            cleaned[k] = str(v)
+    return cleaned
+
 def infer_pair(i, j, df_A, df_B):
     """
     Single API call for one record pair using the PROMPT template.
     Returns dict: {indexA, indexB, answer, input_tokens}
     """
-    recA = df_A.iloc[i].to_dict()
-    recB = df_B.iloc[j].to_dict()
+    recA = clean_record(df_A.iloc[i].to_dict())
+    recB = clean_record(df_B.iloc[j].to_dict())
     pair_hash = record_pair_hash(recA, recB)
 
     # Check cache
