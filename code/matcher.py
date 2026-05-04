@@ -8,13 +8,25 @@ import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
 
-PROMPT = (
-    "You are an expert in data integration and entity resolution. "
-    "Your task is to determine whether the following two records refer to the exact same real-world entity.\n"
-    "Record A: {record_a}\n"
-    "Record B: {record_b}\n"
-    "Question: Do these records match? Please answer strictly with 'Yes' or 'No'."
-)
+PROMPT = """You are an entity resolution system.
+
+Decide whether two records refer to the same real-world entity.
+
+Use robust entity-resolution reasoning:
+- Ignore minor formatting differences, punctuation, capitalization, spacing, and token order.
+- Treat common abbreviations and expanded forms as potentially equivalent when the meaning is clear.
+- Treat missing values as unknown, not as evidence of mismatch.
+- Do not require exact equality across all fields.
+- Prefer agreement on distinctive identifiers, names/titles, model numbers, addresses, dates, or other high-information fields.
+- Return No when there is a clear contradiction on important fields, or when the shared evidence is too weak.
+
+Record A:
+{record_a}
+
+Record B:
+{record_b}
+
+Answer with exactly one word: Yes or No."""
 
 # ---------------------------------------
 # Setup
@@ -28,6 +40,13 @@ client = OpenAI(api_key=API_KEY)
 
 CACHE_DIR = Path("cache/Fodors-Zagat")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def set_cache_dir(cache_dir):
+    """Set the cache directory used by pairwise LLM matching."""
+    global CACHE_DIR
+    CACHE_DIR = Path(cache_dir)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------
 # Cache utilities
@@ -60,13 +79,24 @@ def clean_record(rec):
             cleaned[k] = str(v)
     return cleaned
 
-def infer_pair(i, j, df_A, df_B):
+def infer_pair(i, j, df_A, df_B, selected_attributes=None):
     """
     Single API call for one record pair using the PROMPT template.
+    selected_attributes optionally condenses this post-blocking pair before
+    prompting the LLM.
     Returns dict: {indexA, indexB, answer, input_tokens}
     """
-    recA = clean_record(df_A.iloc[i].to_dict())
-    recB = clean_record(df_B.iloc[j].to_dict())
+    selected_attributes_list = list(selected_attributes) if selected_attributes is not None else list(df_A.columns)
+    selected_attributes_json = json.dumps(selected_attributes_list, ensure_ascii=False)
+
+    recA_raw = df_A.iloc[i].to_dict()
+    recB_raw = df_B.iloc[j].to_dict()
+    if selected_attributes is not None:
+        recA_raw = {attr: recA_raw.get(attr, "") for attr in selected_attributes}
+        recB_raw = {attr: recB_raw.get(attr, "") for attr in selected_attributes}
+
+    recA = clean_record(recA_raw)
+    recB = clean_record(recB_raw)
     pair_hash = record_pair_hash(recA, recB)
 
     # Check cache
@@ -76,7 +106,12 @@ def infer_pair(i, j, df_A, df_B):
             "indexA": i,
             "indexB": j,
             "answer": cached.get("answer"),   # fallback if missing
-            "prompt_tokens": cached.get("prompt_tokens")  # fallback
+            "prompt_tokens": cached.get("prompt_tokens", 0),
+            "completion_tokens": cached.get("completion_tokens", 0),
+            "total_tokens": cached.get("total_tokens", cached.get("prompt_tokens", 0)),
+            "cache_hit": True,
+            "selected_attributes": selected_attributes_json,
+            "selected_attribute_count": len(selected_attributes_list),
         }
 
     # Build prompt
@@ -112,16 +147,21 @@ def infer_pair(i, j, df_A, df_B):
         "answer": answer,
         "prompt_tokens": usage.prompt_tokens,
         "completion_tokens": usage.completion_tokens,
-        "total_tokens": usage.total_tokens
+        "total_tokens": usage.total_tokens,
+        "cache_hit": False,
+        "selected_attributes": selected_attributes_json,
+        "selected_attribute_count": len(selected_attributes_list),
     }
     return result
 
 # ---------------------------------------
 # Concurrent pairwise inference
 # ---------------------------------------
-def infer_candidates_pairwise(df_A, df_B, candidate_pairs, max_workers=8):
+def infer_candidates_pairwise(df_A, df_B, candidate_pairs, max_workers=8, selected_attributes_by_pair=None):
     """
     Run one API call per candidate pair concurrently.
+    selected_attributes_by_pair can be keyed by (idxA, idxB) or candidate-pair
+    ordinal index to condense each post-blocking pair before LLM matching.
     Returns a DataFrame with columns: indexA, indexB, answer, input_tokens
     """
     results = []
@@ -129,10 +169,17 @@ def infer_candidates_pairwise(df_A, df_B, candidate_pairs, max_workers=8):
     completed = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(infer_pair, i, j, df_A, df_B): (i, j)
-            for i, j in candidate_pairs
-        }
+        futures = {}
+        for pair_index, (i, j) in enumerate(candidate_pairs):
+            selected_attributes = None
+            if selected_attributes_by_pair is not None:
+                if isinstance(selected_attributes_by_pair, dict):
+                    selected_attributes = selected_attributes_by_pair.get((i, j))
+                    if selected_attributes is None:
+                        selected_attributes = selected_attributes_by_pair.get(pair_index)
+                else:
+                    selected_attributes = selected_attributes_by_pair[pair_index]
+            futures[executor.submit(infer_pair, i, j, df_A, df_B, selected_attributes)] = (i, j)
         for future in as_completed(futures):
             try:
                 results.append(future.result())

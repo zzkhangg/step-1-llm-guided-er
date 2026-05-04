@@ -22,6 +22,73 @@ ATTRIBUTE_PROMPT = (
     "Return JSON only, no explanation."
 )
 
+ADAPTIVE_PROFILE_PROMPT = (
+    "You are an expert in entity resolution.\n\n"
+    "Your task is to analyze a pair of records and identify which attributes are useful "
+    "for deciding whether the two records refer to the same real-world entity.\n\n"
+    "Important:\n"
+    "- Score each attribute independently based on how useful it is for the match/non-match decision.\n"
+    "- Use only the allowed integer scores: 0, 1, 2, 3.\n"
+    "- Do not score an attribute highly just because the values are identical if both values are empty, "
+    "missing, generic, or uninformative.\n"
+    "- An attribute can be important because it supports a match or because it provides strong evidence "
+    "for a non-match.\n"
+    "- Return JSON only.\n\n"
+    "Scoring guide:\n"
+    "0 = not useful, missing, generic, or irrelevant\n"
+    "1 = weak evidence\n"
+    "2 = useful supporting evidence\n"
+    "3 = highly important or decisive evidence\n\n"
+    "Attributes:\n"
+    "{attributes}\n\n"
+    "Record A:\n"
+    "{record_a_json}\n\n"
+    "Record B:\n"
+    "{record_b_json}\n\n"
+    "Return JSON in this exact format:\n"
+    "{{\n"
+    "  \"attribute_importance\": {{\n"
+    "    \"attribute_name_1\": 0,\n"
+    "    \"attribute_name_2\": 0\n"
+    "  }}\n"
+    "}}"
+)
+
+
+def _clean_record_for_prompt(record):
+    return {
+        k: ('' if pd.isna(v) else str(v))
+        for k, v in record.items()
+    }
+
+
+def _strip_json_fences(content: str) -> str:
+    return content.replace("```json", "").replace("```", "").strip()
+
+
+def parse_adaptive_attribute_importance(content: str, attributes: list) -> dict:
+    """Parse adaptive profiling JSON into integer scores keyed by attribute."""
+    content = _strip_json_fences(content)
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        print(f"  Warning: could not parse adaptive LLM response: {content}")
+        return {attr: 0 for attr in attributes}
+
+    raw_scores = payload.get("attribute_importance", {})
+    if not isinstance(raw_scores, dict):
+        print(f"  Warning: adaptive response missing attribute_importance: {content}")
+        return {attr: 0 for attr in attributes}
+
+    scores = {}
+    for attr in attributes:
+        try:
+            score = int(round(float(raw_scores.get(attr, 0))))
+        except (TypeError, ValueError):
+            score = 0
+        scores[attr] = max(0, min(3, score))
+    return scores
+
 
 # ── 1. Sample representative pairs ──
 
@@ -89,7 +156,7 @@ def query_llm_field_importance(idx_a, idx_b, label, df_A, df_B):
     content = response.choices[0].message.content.strip()
 
     # strip markdown code fences if present
-    content = content.replace("```json", "").replace("```", "").strip()
+    content = _strip_json_fences(content)
 
     try:
         scores = json.loads(content)
@@ -97,6 +164,45 @@ def query_llm_field_importance(idx_a, idx_b, label, df_A, df_B):
     except json.JSONDecodeError:
         print(f"  Warning: could not parse LLM response: {content}")
         return {}
+
+
+def query_llm_adaptive_attribute_importance(idx_a, idx_b, df_A, df_B):
+    """
+    Ask LLM for independent integer 0-3 attribute usefulness scores.
+    Used only by adaptive post-blocking profiling.
+    """
+    scores, _ = query_llm_adaptive_attribute_importance_with_usage(idx_a, idx_b, df_A, df_B)
+    return scores
+
+
+def query_llm_adaptive_attribute_importance_with_usage(idx_a, idx_b, df_A, df_B):
+    """
+    Ask LLM for independent integer 0-3 attribute usefulness scores.
+    Returns (scores, usage_dict) for adaptive post-blocking profiling.
+    """
+    attributes = [c for c in df_A.columns if c in df_B.columns]
+    recA = _clean_record_for_prompt(df_A.iloc[idx_a].to_dict())
+    recB = _clean_record_for_prompt(df_B.iloc[idx_b].to_dict())
+
+    prompt = (ADAPTIVE_PROFILE_PROMPT
+              .replace("{attributes}", json.dumps(attributes, ensure_ascii=False))
+              .replace("{record_a_json}", json.dumps(recA, ensure_ascii=False))
+              .replace("{record_b_json}", json.dumps(recB, ensure_ascii=False)))
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+
+    content = response.choices[0].message.content.strip()
+    usage = response.usage
+    usage_dict = {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    }
+    return parse_adaptive_attribute_importance(content, attributes), usage_dict
 
 
 # ── 3. Aggregate importance scores across all sampled pairs ──
