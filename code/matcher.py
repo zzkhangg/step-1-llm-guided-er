@@ -1,12 +1,12 @@
 import json
 import hashlib
 from pathlib import Path
-from dotenv import load_dotenv
-from openai import OpenAI
 import os
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
+
+from .llm_client import create_chat_completion_text, get_llm_model
 
 PROMPT = """You are an entity resolution system.
 
@@ -18,6 +18,7 @@ Use robust entity-resolution reasoning:
 - Treat missing values as unknown, not as evidence of mismatch.
 - Do not require exact equality across all fields.
 - Prefer agreement on distinctive identifiers, names/titles, model numbers, addresses, dates, or other high-information fields.
+- Treat exact or near-exact model numbers, SKUs, UPCs, ISBNs, and manufacturer part numbers as strong match evidence, even when spacing, punctuation, or token grouping differs.
 - Return No when there is a clear contradiction on important fields, or when the shared evidence is too weak.
 
 Record A:
@@ -31,15 +32,8 @@ Answer with exactly one word: Yes or No."""
 # ---------------------------------------
 # Setup
 # ---------------------------------------
-load_dotenv()
-API_KEY = os.getenv("OPENAI_API_KEY")
-if not API_KEY:
-    raise RuntimeError("OPENAI_API_KEY not found in .env")
-
-client = OpenAI(api_key=API_KEY)
-
-CACHE_DIR = Path("cache/Fodors-Zagat")
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR = Path(os.getenv("MATCHER_CACHE_DIR", "cache/default"))
+USE_CACHE = os.getenv("MATCHER_DISABLE_CACHE", "").lower() not in {"1", "true", "yes"}
 
 
 def set_cache_dir(cache_dir):
@@ -48,14 +42,38 @@ def set_cache_dir(cache_dir):
     CACHE_DIR = Path(cache_dir)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def set_cache_enabled(enabled):
+    """Enable or disable pairwise LLM matching cache reads and writes."""
+    global USE_CACHE
+    USE_CACHE = bool(enabled)
+
 # ---------------------------------------
 # Cache utilities
 # ---------------------------------------
-def record_pair_hash(recA, recB):
-    rec_str = json.dumps([recA, recB], sort_keys=True)
+def prompt_hash(prompt_template=None):
+    """Return a stable hash for the matcher prompt template."""
+    if prompt_template is None:
+        prompt_template = PROMPT
+    return hashlib.sha256(prompt_template.encode()).hexdigest()
+
+
+def record_pair_hash(recA, recB, model, prompt_template=None):
+    if prompt_template is None:
+        prompt_template = PROMPT
+    rec_str = json.dumps(
+        {
+            "model": model,
+            "prompt_hash": prompt_hash(prompt_template),
+            "records": [recA, recB],
+        },
+        sort_keys=True,
+    )
     return hashlib.sha256(rec_str.encode()).hexdigest()
 
 def load_from_cache(pair_hash):
+    if not USE_CACHE:
+        return None
     cache_file = CACHE_DIR / f"{pair_hash}.json"
     if cache_file.exists():
         with open(cache_file, "r") as f:
@@ -63,6 +81,9 @@ def load_from_cache(pair_hash):
     return None
 
 def save_to_cache(pair_hash, data):
+    if not USE_CACHE:
+        return
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_file = CACHE_DIR / f"{pair_hash}.json"
     with open(cache_file, "w") as f:
         json.dump(data, f, indent=2)
@@ -97,7 +118,9 @@ def infer_pair(i, j, df_A, df_B, selected_attributes=None):
 
     recA = clean_record(recA_raw)
     recB = clean_record(recB_raw)
-    pair_hash = record_pair_hash(recA, recB)
+    model = get_llm_model()
+    active_prompt_hash = prompt_hash()
+    pair_hash = record_pair_hash(recA, recB, model)
 
     # Check cache
     cached = load_from_cache(pair_hash)
@@ -110,6 +133,9 @@ def infer_pair(i, j, df_A, df_B, selected_attributes=None):
             "completion_tokens": cached.get("completion_tokens", 0),
             "total_tokens": cached.get("total_tokens", cached.get("prompt_tokens", 0)),
             "cache_hit": True,
+            "llm_model": model,
+            "llm_error": "",
+            "prompt_hash": cached.get("prompt_hash", active_prompt_hash),
             "selected_attributes": selected_attributes_json,
             "selected_attribute_count": len(selected_attributes_list),
         }
@@ -119,24 +145,21 @@ def infer_pair(i, j, df_A, df_B, selected_attributes=None):
           .replace("{record_a}", json.dumps(recA, ensure_ascii=False))
           .replace("{record_b}", json.dumps(recB, ensure_ascii=False)))
 
-    # Single API call
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
+    content, usage = create_chat_completion_text(
         messages=[{"role": "user", "content": prompt}],
-        temperature=0
+        temperature=0,
     )
-
-    content = response.choices[0].message.content.strip()
     answer  = "Yes" if content.lower().startswith("yes") else "No"
-
-    usage = response.usage
 
     data = {
         "prompt": prompt,
+        "model": model,
+        "prompt_hash": active_prompt_hash,
         "answer": answer,
-        "prompt_tokens": usage.prompt_tokens,
-        "completion_tokens": usage.completion_tokens,
-        "total_tokens": usage.total_tokens
+        "raw_response": content,
+        "prompt_tokens": usage["prompt_tokens"],
+        "completion_tokens": usage["completion_tokens"],
+        "total_tokens": usage["total_tokens"],
     }
 
     save_to_cache(pair_hash, data)
@@ -145,10 +168,13 @@ def infer_pair(i, j, df_A, df_B, selected_attributes=None):
         "indexA": i,
         "indexB": j,
         "answer": answer,
-        "prompt_tokens": usage.prompt_tokens,
-        "completion_tokens": usage.completion_tokens,
-        "total_tokens": usage.total_tokens,
+        "prompt_tokens": usage["prompt_tokens"],
+        "completion_tokens": usage["completion_tokens"],
+        "total_tokens": usage["total_tokens"],
         "cache_hit": False,
+        "llm_model": model,
+        "llm_error": "",
+        "prompt_hash": active_prompt_hash,
         "selected_attributes": selected_attributes_json,
         "selected_attribute_count": len(selected_attributes_list),
     }
@@ -179,12 +205,35 @@ def infer_candidates_pairwise(df_A, df_B, candidate_pairs, max_workers=8, select
                         selected_attributes = selected_attributes_by_pair.get(pair_index)
                 else:
                     selected_attributes = selected_attributes_by_pair[pair_index]
-            futures[executor.submit(infer_pair, i, j, df_A, df_B, selected_attributes)] = (i, j)
+            futures[executor.submit(infer_pair, i, j, df_A, df_B, selected_attributes)] = (
+                i,
+                j,
+                selected_attributes,
+            )
         for future in as_completed(futures):
             try:
                 results.append(future.result())
             except Exception as e:
-                i, j = futures[future]
+                i, j, selected_attributes = futures[future]
+                selected_attributes_list = (
+                    list(selected_attributes)
+                    if selected_attributes is not None
+                    else list(df_A.columns)
+                )
+                results.append({
+                    "indexA": i,
+                    "indexB": j,
+                    "answer": "Error",
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "cache_hit": False,
+                    "llm_model": get_llm_model(),
+                    "llm_error": str(e),
+                    "prompt_hash": prompt_hash(),
+                    "selected_attributes": json.dumps(selected_attributes_list, ensure_ascii=False),
+                    "selected_attribute_count": len(selected_attributes_list),
+                })
                 print(f"  Error on pair ({i}, {j}): {e}")
             completed += 1
             if completed % 100 == 0:

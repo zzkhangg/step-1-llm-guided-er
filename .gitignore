@@ -7,3 +7,5 @@ __pycache__
 *.pkl
 .codex
 logs/
+
+CLAUDE.md

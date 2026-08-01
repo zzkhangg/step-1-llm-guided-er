@@ -28,20 +28,36 @@ FEATURE_ORDER = (
     "is_numeric",
 )
 
+OTHER_ATTRIBUTE_HINTS = (
+    "image_url",
+    "imageurl",
+    "source_url",
+    "original_id",
+    "source_id",
+    "record_id",
+    "row_id",
+    "url",
+    "link",
+    "image",
+)
+
 IDENTITY_ATTRIBUTE_HINTS = (
     "title",
     "name",
-    "author",
-    "authors",
-    "product",
-    "brand",
+    "modelno",
     "model",
     "isbn",
     "doi",
     "sku",
-    "url",
+    "upc",
     "email",
     "phone",
+)
+
+STRONG_SUPPORT_ATTRIBUTE_HINTS = (
+    "brand",
+    "authors",
+    "author",
 )
 
 CONTEXT_ATTRIBUTE_HINTS = (
@@ -53,6 +69,13 @@ CONTEXT_ATTRIBUTE_HINTS = (
     "type",
     "category",
     "class",
+)
+
+RELATIVE_NUMERIC_ATTRIBUTE_HINTS = (
+    "price",
+    "cost",
+    "amount",
+    "msrp",
 )
 
 
@@ -103,6 +126,47 @@ def _parse_number(value: str):
     return None
 
 
+def _uses_relative_numeric_scale(attribute: str) -> bool:
+    attr_text = str(attribute).lower()
+    return any(hint in attr_text for hint in RELATIVE_NUMERIC_ATTRIBUTE_HINTS)
+
+
+def compute_numeric_scales(table_a, table_b, attributes, method="iqr") -> Dict[str, float]:
+    """Compute dataset-level scales for numeric attributes that need them."""
+    scales = {}
+    for attr in attributes:
+        if _uses_relative_numeric_scale(attr):
+            continue
+
+        values = []
+        for table in (table_a, table_b):
+            if attr not in table:
+                continue
+            for value in table[attr]:
+                number = _parse_number(_clean_value(value))
+                if number is not None:
+                    values.append(number)
+
+        if not values:
+            continue
+
+        arr = np.asarray(values, dtype=float)
+        if method == "iqr":
+            q1, q3 = np.percentile(arr, [25, 75])
+            scale = float(q3 - q1)
+        elif method == "std":
+            scale = float(np.std(arr))
+        elif method == "range":
+            scale = float(np.max(arr) - np.min(arr))
+        else:
+            raise ValueError("method must be one of: iqr, std, range")
+
+        if scale <= 0:
+            scale = float(max(np.max(np.abs(arr)), 1.0))
+        scales[attr] = scale
+    return scales
+
+
 def _safe_normalize(vector: np.ndarray, fallback_size: int | None = None) -> np.ndarray:
     arr = np.asarray(vector, dtype=float)
     arr = np.clip(arr, 0.0, None)
@@ -137,8 +201,12 @@ def infer_attribute_roles(attributes: Sequence[str]) -> Dict[str, str]:
     roles = {}
     for attr in attributes:
         attr_text = str(attr).lower()
-        if any(hint in attr_text for hint in IDENTITY_ATTRIBUTE_HINTS):
+        if any(hint in attr_text for hint in OTHER_ATTRIBUTE_HINTS):
+            roles[attr] = "other"
+        elif any(hint in attr_text for hint in IDENTITY_ATTRIBUTE_HINTS):
             roles[attr] = "identity"
+        elif any(hint in attr_text for hint in STRONG_SUPPORT_ATTRIBUTE_HINTS):
+            roles[attr] = "strong_support"
         elif any(hint in attr_text for hint in CONTEXT_ATTRIBUTE_HINTS):
             roles[attr] = "context"
         else:
@@ -156,6 +224,98 @@ def _similarity_scores(candidate_pairs, pair_similarity_scores) -> np.ndarray:
     if scores.shape[0] != len(candidate_pairs):
         raise ValueError("pair_similarity_scores must align with candidate_pairs")
     return scores
+
+
+def _stratified_quotas(target, medium_ratio=0.6, low_ratio=0.2, high_ratio=0.2):
+    ratios = {"medium": medium_ratio, "low": low_ratio, "high": high_ratio}
+    quotas = {name: int(round(target * ratio)) for name, ratio in ratios.items()}
+    quotas["medium"] += target - sum(quotas.values())
+    return quotas
+
+
+def _similarity_strata(scores):
+    q_low, q_high = np.quantile(scores, [1.0 / 3.0, 2.0 / 3.0])
+    return {
+        "low": np.where(scores <= q_low)[0].tolist(),
+        "medium": np.where((scores > q_low) & (scores < q_high))[0].tolist(),
+        "high": np.where(scores >= q_high)[0].tolist(),
+    }
+
+
+def select_random_profile_pairs(candidate_pairs, sample_size, seed=42):
+    """Uniform random baseline for choosing post-blocking profile pairs."""
+    pairs = list(candidate_pairs)
+    if sample_size <= 0 or not pairs:
+        return [], []
+
+    target = min(int(sample_size), len(pairs))
+    rng = np.random.RandomState(seed)
+    selected = rng.choice(len(pairs), size=target, replace=False).tolist()
+    return [pairs[idx] for idx in selected], selected
+
+
+def compute_importance_proxy_scores(candidate_pairs, pair_similarity_scores, pair_features) -> np.ndarray:
+    """Score pairs by how informative they are likely to be before LLM profiling.
+
+    The score is label-free. It favors ambiguous blocked pairs whose attributes
+    provide mixed evidence, because those pairs are more useful for learning
+    which attributes should carry importance during transfer.
+    """
+    pairs = list(candidate_pairs)
+    if not pairs:
+        return np.asarray([], dtype=float)
+
+    features = _pair_feature_matrix(pairs, pair_features)
+    scores = np.clip(_similarity_scores(pairs, pair_similarity_scores), 0.0, 1.0)
+
+    feature_count = len(FEATURE_ORDER)
+    if features.shape[1] >= feature_count and features.shape[1] % feature_count == 0:
+        grouped = features.reshape(features.shape[0], -1, feature_count)
+        # Use the agreement signals, excluding the is_numeric indicator.
+        attribute_evidence = np.max(grouped[:, :, : feature_count - 1], axis=2)
+    else:
+        attribute_evidence = np.clip(features, 0.0, 1.0)
+
+    evidence_mean = attribute_evidence.mean(axis=1)
+    evidence_contrast = np.clip(attribute_evidence.std(axis=1) / 0.5, 0.0, 1.0)
+    evidence_mixedness = 1.0 - np.clip(np.abs(evidence_mean - 0.5) / 0.5, 0.0, 1.0)
+
+    if len(scores) <= 1:
+        similarity_uncertainty = np.ones_like(scores, dtype=float)
+    else:
+        center = float(np.median(scores))
+        spread = float(np.max(np.abs(scores - center)))
+        if spread <= 1e-12:
+            similarity_uncertainty = np.ones_like(scores, dtype=float)
+        else:
+            similarity_uncertainty = 1.0 - np.clip(np.abs(scores - center) / spread, 0.0, 1.0)
+
+    proxy_scores = (
+        0.50 * evidence_contrast
+        + 0.30 * similarity_uncertainty
+        + 0.20 * evidence_mixedness
+    )
+    return np.clip(proxy_scores, 0.0, 1.0)
+
+
+def select_importance_based_profile_pairs(
+    candidate_pairs,
+    pair_similarity_scores,
+    pair_features,
+    sample_size,
+    seed=42,
+):
+    """Select profile pairs with high label-free expected importance signal."""
+    pairs = list(candidate_pairs)
+    if sample_size <= 0 or not pairs:
+        return [], []
+
+    target = min(int(sample_size), len(pairs))
+    proxy_scores = compute_importance_proxy_scores(pairs, pair_similarity_scores, pair_features)
+    rng = np.random.RandomState(seed)
+    tie_breaker = rng.random(len(pairs))
+    selected = np.lexsort((tie_breaker, -proxy_scores))[:target].tolist()
+    return [pairs[idx] for idx in selected], selected
 
 
 def select_profile_pairs(
@@ -181,18 +341,15 @@ def select_profile_pairs(
 
     scores = np.clip(_similarity_scores(pairs, pair_similarity_scores), 0.0, 1.0)
     target = min(int(sample_size), len(pairs))
-    q_low, q_high = np.quantile(scores, [1.0 / 3.0, 2.0 / 3.0])
-
-    strata = {
-        "low": np.where(scores <= q_low)[0].tolist(),
-        "medium": np.where((scores > q_low) & (scores < q_high))[0].tolist(),
-        "high": np.where(scores >= q_high)[0].tolist(),
-    }
+    strata = _similarity_strata(scores)
 
     rng = np.random.RandomState(seed)
-    ratios = {"medium": medium_ratio, "low": low_ratio, "high": high_ratio}
-    quotas = {name: int(round(target * ratio)) for name, ratio in ratios.items()}
-    quotas["medium"] += target - sum(quotas.values())
+    quotas = _stratified_quotas(
+        target,
+        medium_ratio=medium_ratio,
+        low_ratio=low_ratio,
+        high_ratio=high_ratio,
+    )
 
     selected = []
     for name in ("medium", "low", "high"):
@@ -211,6 +368,111 @@ def select_profile_pairs(
             continue
         take = min(target - len(selected), len(available))
         selected.extend(rng.choice(available, size=take, replace=False).tolist())
+
+    selected = selected[:target]
+    return [pairs[idx] for idx in selected], selected
+
+
+def _pair_feature_matrix(candidate_pairs, pair_features) -> np.ndarray:
+    features = np.asarray(pair_features, dtype=float)
+    if features.ndim == 1:
+        features = features.reshape(1, -1)
+    if features.shape[0] != len(candidate_pairs):
+        raise ValueError("pair_features must align with candidate_pairs")
+    return np.nan_to_num(features, nan=0.0, posinf=1.0, neginf=0.0)
+
+
+def _select_diverse_indices(pair_features, candidate_indices, sample_size, rng):
+    available_indices = list(dict.fromkeys(int(idx) for idx in candidate_indices))
+    target = min(int(sample_size), len(available_indices))
+    if target <= 0:
+        return []
+    if target == len(available_indices):
+        return available_indices
+
+    local_features = pair_features[available_indices]
+    center = local_features.mean(axis=0)
+    center_distances = np.linalg.norm(local_features - center, axis=1)
+    first_candidates = np.flatnonzero(np.isclose(center_distances, center_distances.max()))
+    first_position = int(rng.choice(first_candidates))
+
+    selected_positions = [first_position]
+    selected_position_set = {first_position}
+    min_distances = np.linalg.norm(local_features - local_features[first_position], axis=1)
+    min_distances[first_position] = -np.inf
+
+    while len(selected_positions) < target:
+        best_distance = np.max(min_distances)
+        best_positions = np.flatnonzero(np.isclose(min_distances, best_distance))
+        next_position = int(rng.choice(best_positions))
+        selected_positions.append(next_position)
+        selected_position_set.add(next_position)
+
+        distances = np.linalg.norm(local_features - local_features[next_position], axis=1)
+        min_distances = np.minimum(min_distances, distances)
+        for position in selected_position_set:
+            min_distances[position] = -np.inf
+
+    return [available_indices[position] for position in selected_positions]
+
+
+def select_diverse_profile_pairs(candidate_pairs, pair_features, sample_size, seed=42):
+    """Select profile pairs with farthest-first coverage in pair-feature space."""
+    pairs = list(candidate_pairs)
+    if sample_size <= 0 or not pairs:
+        return [], []
+
+    features = _pair_feature_matrix(pairs, pair_features)
+    rng = np.random.RandomState(seed)
+    selected = _select_diverse_indices(features, range(len(pairs)), sample_size, rng)
+    return [pairs[idx] for idx in selected], selected
+
+
+def select_stratified_diverse_profile_pairs(
+    candidate_pairs,
+    pair_similarity_scores,
+    pair_features,
+    sample_size,
+    medium_ratio=0.6,
+    low_ratio=0.2,
+    high_ratio=0.2,
+    seed=42,
+):
+    """Stratify by blocking similarity, then diversify within each stratum.
+
+    This is label-free: similarity comes from blocking embeddings and diversity
+    comes from pair-level attribute agreement features.
+    """
+    pairs = list(candidate_pairs)
+    if sample_size <= 0 or not pairs:
+        return [], []
+
+    features = _pair_feature_matrix(pairs, pair_features)
+    scores = np.clip(_similarity_scores(pairs, pair_similarity_scores), 0.0, 1.0)
+    target = min(int(sample_size), len(pairs))
+    strata = _similarity_strata(scores)
+    quotas = _stratified_quotas(
+        target,
+        medium_ratio=medium_ratio,
+        low_ratio=low_ratio,
+        high_ratio=high_ratio,
+    )
+    rng = np.random.RandomState(seed)
+
+    selected = []
+    for name in ("medium", "low", "high"):
+        available = [idx for idx in strata[name] if idx not in selected]
+        take = min(quotas[name], len(available))
+        if take > 0:
+            selected.extend(_select_diverse_indices(features, available, take, rng))
+
+    for name in ("medium", "low", "high"):
+        if len(selected) >= target:
+            break
+        available = [idx for idx in strata[name] if idx not in selected]
+        take = min(target - len(selected), len(available))
+        if take > 0:
+            selected.extend(_select_diverse_indices(features, available, take, rng))
 
     selected = selected[:target]
     return [pairs[idx] for idx in selected], selected

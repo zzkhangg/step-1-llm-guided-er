@@ -1,0 +1,132 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{graphicx}
+
+\setlength{\emergencystretch}{2em}
+
+\title{Weekly Progress Report: Adaptive Sampler Experiments}
+\author{}
+\date{2026-06-16}
+
+\begin{document}
+\maketitle
+
+\section{Scope}
+
+This report covers the current comparable sampler runs for Fodors--Zagat and DBLP--ACM. Amazon--Walmart is excluded for now because a comparable full sampler batch is not yet available.
+
+The main comparison uses end-to-end precision, recall, and F1. The supervised method is included only as a gold-label upper-bound baseline: it uses labeled ground-truth pairs and is not a label-free sampler.
+
+\section{Experimental Framing}
+
+The adaptive samplers select a small profiling set from the post-blocking candidate pairs. This profiling set is used to estimate which attributes are most useful for the downstream matching task. The sampler therefore affects the quality of attribute selection, but it does not directly decide whether any candidate pair is a match.
+
+The label-free samplers operate only on observable pair properties such as similarity, feature-space distance, and evidence patterns between records. The supervised baseline is different: it uses known positive and negative examples from the ground truth, so it should be interpreted as a labeled comparison point rather than as a deployable label-free sampler.
+
+\section{How the Samplers Work}
+
+Let \(C\) denote the post-blocking candidate set and let \(k\) denote the profiling budget. Each sampler returns a subset \(S \subset C\), where \(|S| = k\), designed to expose the attribute-selection step to useful examples of pairwise evidence.
+
+\subsection{Random Sampling}
+
+Random sampling chooses \(k\) candidate pairs uniformly from \(C\). Every post-blocking pair has the same probability of being selected. This method is useful as a neutral baseline because it does not intentionally favor ambiguous, diverse, easy, or hard examples.
+
+Its main strength is simplicity and lack of sampling assumptions. Its weakness is that it may waste profiling budget on redundant pairs or on pairs that are uninformative for distinguishing useful attributes.
+
+\subsection{Similarity-Stratified Sampling}
+
+Similarity-stratified sampling first orders candidate pairs by their overall pair similarity and divides the distribution into low-, medium-, and high-similarity strata. The profiling budget is then allocated across these strata using a 20/60/20 split: 20\% low similarity, 60\% medium similarity, and 20\% high similarity.
+
+The intuition is that medium-similarity pairs are often the most informative because their match status is less obvious from global similarity alone. Low-similarity and high-similarity pairs are still included so the attribute-selection step sees both negative-looking and positive-looking evidence patterns. This makes the sampler a representativeness-based method: it tries to cover the shape of the similarity distribution while emphasizing the region where attribute evidence is most likely to matter.
+
+\subsection{Diversity Sampling}
+
+Diversity sampling represents each candidate pair in an abstract feature space that captures pair-level evidence, such as similarity and attribute disagreement patterns. It then selects pairs that are far apart from one another in this space. Conceptually, each new selected pair should add evidence that is not already well represented by the current profiling set.
+
+The objective is coverage. Instead of spending multiple profiling slots on near-duplicate examples, the sampler spreads the profiling budget across different evidence patterns. This can help attribute selection discover a broader range of useful signals, especially when candidate pairs vary substantially in structure or quality.
+
+\subsection{Stratified Diversity Sampling}
+
+Stratified diversity combines the previous two ideas. It first divides the candidate pairs into low-, medium-, and high-similarity strata, then performs diversity-oriented selection within each stratum. The same 20/60/20 allocation is used to preserve emphasis on the medium-similarity region.
+
+This sampler is designed to balance representativeness and coverage. Similarity stratification prevents the profiling set from being dominated by only one region of the candidate distribution, while diversity selection within each region reduces redundancy among the selected examples.
+
+\subsection{Importance-Based Sampling}
+
+Importance-based sampling assigns each unlabeled candidate pair a proxy informativeness score. The score is label-free: it does not use ground-truth match labels. Instead, it estimates whether a pair is likely to be useful for learning attribute importance.
+
+The proxy combines three abstract signals. First, evidence contrast measures whether the pair contains clear differences among attribute-level signals, so that some attributes appear more discriminative than others. Second, similarity uncertainty favors pairs that are not trivially easy according to global similarity. Third, evidence mixedness favors pairs where the record evidence is not uniformly positive or uniformly negative, because mixed evidence can reveal which attributes should dominate the matching decision.
+
+The sampler prioritizes pairs with high proxy informativeness. The intended effect is to spend profiling budget on pairs that are likely to clarify which attributes are reliable, which attributes are noisy, and which attributes should be downweighted.
+
+\subsection{Supervised Baseline}
+
+The supervised baseline uses 50 known positive pairs and 50 known negative pairs from the ground truth. These labeled examples allow the method to estimate which attributes best separate matches from non-matches.
+
+Because it relies on labels, this baseline is not comparable as a label-free sampler. Its role is to provide a gold-label upper-bound or reference point for judging how close the label-free samplers can get without supervised information.
+
+\section{Current Results}
+
+Metrics are end-to-end over the full ground-truth set. Missed GT is total ground-truth matches minus true positives. Tokens is total token usage for the full experiment. Bold values mark the best result within each dataset and column; ties are bolded. For FP, Missed GT, and Tokens, lower is better.
+
+\begin{table}[htbp]
+\centering
+\small
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llrrrrrrr}
+\toprule
+Dataset & Method & E2E F1 & Precision & Recall & TP & FP & Missed GT & Tokens \\
+\midrule
+Fodors--Zagat & random & 0.7802 & 0.9861 & 0.6455 & 71 & 1 & 39 & 799,337 \\
+Fodors--Zagat & similarity\_stratified & 0.9171 & 0.9895 & 0.8545 & 94 & 1 & 16 & 790,783 \\
+Fodors--Zagat & diversity & 0.8254 & 0.9873 & 0.7091 & 78 & 1 & 32 & 795,049 \\
+Fodors--Zagat & stratified\_diversity & 0.8108 & \textbf{1.0000} & 0.6818 & 75 & \textbf{0} & 35 & 797,786 \\
+Fodors--Zagat & importance\_based & 0.8601 & \textbf{1.0000} & 0.7545 & 83 & \textbf{0} & 27 & 800,334 \\
+Fodors--Zagat & supervised & \textbf{0.9725} & 0.9815 & \textbf{0.9636} & \textbf{106} & 2 & \textbf{4} & \textbf{653,644} \\
+DBLP--ACM & random & 0.9235 & 0.9722 & 0.8795 & 1,956 & 56 & 268 & 3,937,499 \\
+DBLP--ACM & similarity\_stratified & 0.9200 & 0.9715 & 0.8737 & 1,943 & 57 & 281 & 3,963,382 \\
+DBLP--ACM & diversity & 0.9162 & 0.9761 & 0.8633 & 1,920 & \textbf{47} & 304 & 4,030,092 \\
+DBLP--ACM & stratified\_diversity & 0.9066 & 0.9669 & 0.8534 & 1,898 & 65 & 326 & 4,008,799 \\
+DBLP--ACM & importance\_based & \textbf{0.9605} & \textbf{0.9768} & 0.9447 & 2,101 & 50 & 123 & 3,910,646 \\
+DBLP--ACM & supervised & 0.9515 & 0.9289 & \textbf{0.9753} & \textbf{2,169} & 166 & \textbf{55} & \textbf{3,502,759} \\
+\bottomrule
+\end{tabular}%
+}
+\caption{Current comparable end-to-end results for the evaluated samplers.}
+\label{tab:sampler-results}
+\end{table}
+
+\section{Interpretation}
+
+\subsection{Fodors--Zagat}
+
+The supervised baseline has the best F1, but it uses gold labels. Among label-free samplers, similarity-stratified sampling is strongest with 0.9171 end-to-end F1. Importance-based sampling is too conservative on this dataset: it reaches perfect precision but loses too much recall.
+
+\subsection{DBLP--ACM}
+
+Importance-based sampling is strongest overall with 0.9605 end-to-end F1, ahead of the supervised baseline's 0.9515 end-to-end F1. This is the strongest current evidence that the new sampler is useful: the label-free proxy improves the end-to-end outcome on a larger dataset while also keeping precision high.
+
+\subsection{Current Story}
+
+Adaptive sampling should be framed as label-free attribute selection. The supervised run should be described as a labeled upper-bound or comparison point, not as a competing label-free sampler.
+
+\section{Missing Data and Next Work}
+
+The current weekly comparison is complete for Fodors--Zagat and DBLP--ACM across the evaluated samplers. The next work is to strengthen the evidence before using these results as thesis claims.
+
+\begin{enumerate}
+    \item Add full-attribute baselines for Fodors--Zagat and DBLP--ACM, using the same end-to-end metrics and token accounting as Table~\ref{tab:sampler-results}.
+    \item Repeat the sampler runs across multiple seeds, then report mean and standard deviation for F1, precision, recall, and token use.
+    \item Investigate the Fodors--Zagat recall gap for importance-based sampling, since it improves precision but misses more true matches than similarity-stratified sampling.
+    \item Add Amazon--Walmart only after the same sampler set is available under the same evaluation protocol.
+\end{enumerate}
+
+Supervisor feedback would be most useful on two framing points: whether supervised should remain in the main table as a labeled upper-bound baseline, and whether similarity-stratified sampling should be renamed or described as the representativeness-based sampler.
+
+\section{Summary}
+
+The current evidence supports different conclusions by dataset. On Fodors--Zagat, the best label-free method is similarity-stratified sampling, while the supervised baseline remains strongest because it uses gold labels. On DBLP--ACM, importance-based sampling is the best overall method and exceeds the supervised baseline in end-to-end F1. The main thesis framing should therefore emphasize adaptive sampling as a label-free attribute-selection mechanism, with supervised selection used only as a labeled reference point.
+
+\end{document}

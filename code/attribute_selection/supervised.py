@@ -93,6 +93,18 @@ def train_attribute_selector(df_A, df_B, labeled_pairs, cols):
     print(f"Positive matches : {sum(1 for _, _, l in labeled_pairs if l == 1)}")
     print(f"Negative matches : {sum(1 for _, _, l in labeled_pairs if l == 0)}")
 
+    if not cols:
+        raise ValueError("Supervised tuple strategy requires at least one common attribute column.")
+    if not labeled_pairs:
+        raise ValueError("Supervised tuple strategy requires labeled positive and negative pairs.")
+
+    labels = {label for _, _, label in labeled_pairs}
+    if labels != {0, 1}:
+        raise ValueError(
+            "Supervised tuple strategy requires both positive and negative pairs. "
+            f"Observed labels: {sorted(labels)}"
+        )
+
     X, y = build_feature_matrix(df_A, df_B, labeled_pairs, cols)
 
     # scale features
@@ -114,6 +126,13 @@ def train_attribute_selector(df_A, df_B, labeled_pairs, cols):
         col_indices  = [feature_names.index(f) for f in col_features]
         attr_importance[col] = weights[col_indices].max()
 
+    total_importance = sum(attr_importance.values())
+    if total_importance > 0:
+        attr_importance = {
+            attr: score / total_importance
+            for attr, score in attr_importance.items()
+        }
+
     # rank attributes by importance
     ranked = sorted(attr_importance.items(), key=lambda x: -x[1])
 
@@ -131,7 +150,7 @@ def train_attribute_selector(df_A, df_B, labeled_pairs, cols):
 
 # ── 4. Select top attributes based on importance ──
 
-def select_top_attributes(ranked, threshold=0.1):
+def select_top_attributes(ranked, threshold=0.1, top_k=None):
     """
     Keep attributes whose importance score exceeds threshold.
     
@@ -139,9 +158,13 @@ def select_top_attributes(ranked, threshold=0.1):
     ----------
     ranked    : list of (attr, score) from train_attribute_selector
     threshold : minimum importance score to keep attribute
+    top_k     : maximum number of ranked attributes to retain
     """
     selected = [attr for attr, score in ranked if score >= threshold]
-    print(f"\nSelected attributes (score >= {threshold}): {selected}")
+    if top_k is not None:
+        selected = selected[: int(top_k)]
+    top_k_text = "all" if top_k is None else str(top_k)
+    print(f"\nSelected attributes (score >= {threshold}, top_k={top_k_text}): {selected}")
     return selected
 
 
