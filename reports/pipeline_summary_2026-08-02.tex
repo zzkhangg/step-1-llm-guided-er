@@ -1,0 +1,460 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{amsmath}
+
+\setlength{\emergencystretch}{2em}
+
+\title{LLM-Assisted Entity Resolution:\\Summary of Findings and Current Status}
+\author{}
+\date{2026-08-02}
+
+\begin{document}
+\maketitle
+
+\section{Purpose}
+
+This report describes how the entity-resolution pipeline works, explains each
+attribute-selection methodology it implements, and summarizes what the experiments so
+far establish. The methodology sections are complete; the results are condensed. Full
+per-run provenance and the detailed statistical analysis behind each finding are in
+the companion report dated 2026-08-01.
+
+All numbers come from runs matching the pipeline's current configuration: embedding
+model \texttt{BAAI/bge-large-en-v1.5}, matcher LLM \texttt{google/gemini-2.5-flash} via
+OpenRouter. Fodors--Zagat runs exclude the leaking \texttt{class} attribute
+(Section~\ref{sec:leak}); runs whose LLM calls failed are excluded entirely
+(Section~\ref{sec:defects}).
+
+\section{Pipeline Overview}
+
+The pipeline runs in five stages, each timed and recorded in a per-run JSON summary
+under \texttt{logs/<dataset>/runs/}.
+
+\textbf{Load and normalize.} Both tables and the ground truth are read, ID columns
+are dropped, and every remaining field is passed through a normalization step that
+expands or standardizes address and directional abbreviations, and cleans up
+Unicode/HTML artifacts, so that superficial formatting differences do not by
+themselves create false mismatches later in the pipeline.
+
+\textbf{Embed and block.} Each attribute column is encoded independently with the
+SentenceBERT model, the column vectors are concatenated and L2-normalized into one
+embedding per record, and multi-probe locality-sensitive hashing (random
+hyperplanes, with single-bit flips at query time) retrieves the top-$k$ most similar
+Table-B candidates for every Table-A record. This reduces the pairwise comparison
+space from the full cross product down to a much smaller candidate-pair set before
+any LLM is involved.
+
+\textbf{Step 1 -- global tuple condensation (optional).} One attribute subset is
+chosen once for the whole dataset and applied to every candidate pair before
+re-blocking on the condensed attributes. This step is described in full in
+Section~\ref{sec:step1}.
+
+\textbf{Step 1.5 -- adaptive per-pair attribute selection (optional).} Instead of one
+global subset, a small sample of candidate pairs is profiled by the LLM for
+per-attribute importance, and a hybrid predictor/retriever model transfers a
+\emph{different} attribute subset to every candidate pair. This step is described in
+full in Section~\ref{sec:step15}.
+
+\textbf{Match.} One LLM call decides Yes/No per candidate pair, using only the
+attributes selected for that pair (all attributes if neither Step 1 nor Step 1.5
+ran). Every response is cached on disk keyed by a hash of the model, prompt
+template, and record content, so repeated experiments over the same configuration
+do not re-spend tokens.
+
+\textbf{Metrics and logging.} Precision, recall, and F1 are computed both at the
+candidate-pair level (only pairs that survived blocking) and end-to-end (relative to
+all ground-truth matches, so blocking misses count against recall), alongside
+token-usage accounting split by stage.
+
+\section{Methodology}
+\label{sec:methodology}
+
+\subsection{Step 1: Global Tuple Condensation}
+\label{sec:step1}
+
+The motivation for Step 1 is that showing an LLM every attribute for every pair
+wastes tokens on fields that are frequently empty, redundant, or simply irrelevant
+to the match decision, and can make the model's decision worse by diluting the
+signal from the few attributes that actually distinguish entities. Step 1 picks
+\emph{one} attribute subset for the whole dataset, used for every pair, via one of
+four strategies.
+
+\paragraph{Manual selection.} A fixed, user-supplied list of attribute names is kept
+and everything else is dropped, with no data-driven reasoning involved. It is the
+cheapest strategy to run (no LLM calls, no labeled data required) and is appropriate
+when a person can already tell from the schema which fields carry identity
+information, but it does not adapt if that judgment is wrong for some records.
+
+\paragraph{Heuristic selection.} Attributes are pruned using two label-free,
+corpus-level statistics: the fraction of missing values (an attribute that is empty
+in most records cannot be evidence of anything) and the fraction of unique values
+(an attribute that takes almost the same value everywhere carries little
+discriminative signal). Attributes that survive pruning are also \emph{compressed}:
+long text fields are stripped of boilerplate words (via a stopword/marketing-language
+regex list) and only high-signal tokens are kept -- numbers, alphanumeric
+codes/identifiers, capitalized proper nouns, and unit-bearing measurements (e.g.\
+\texttt{"12 kg"}) -- so that a lengthy description field still contributes its
+distinctive tokens without its full token count.
+
+\paragraph{LLM-guided selection.} A small labeled sample of matching and
+non-matching pairs is shown to the LLM one pair at a time, together with the
+question ``which fields were most influential in deciding whether these two records
+match?'', and the model returns the smallest sufficient subset of attribute names for
+that pair. Responses are aggregated across the sample by \emph{selection frequency}
+per attribute (what fraction of responses named that attribute), attributes are
+ranked by that frequency, and the final subset keeps every attribute above a
+frequency threshold (optionally capped to a top-$k$).
+
+\paragraph{Supervised selection.} For the same labeled sample, three field-level
+similarity features are computed per attribute for every pair -- token-set Jaccard
+overlap, normalized edit-distance similarity, and an exact-match indicator -- and a
+logistic regression classifier (features standardized, class-balanced) is trained to
+predict match/non-match from all attributes' features at once. Each attribute's
+importance is the maximum absolute regression weight across its three features,
+normalized so all attributes' importance scores sum to one; the top-ranked
+attributes above a threshold (optionally capped to top-$k$) are kept. Because it
+learns from labeled evidence directly, this strategy tends to identify a very small,
+highly discriminative attribute subset (see Section~\ref{sec:results}).
+
+Whichever strategy is used, the condensed table is then re-embedded and re-blocked
+(so blocking itself also benefits from the smaller, more focused attribute set)
+before matching.
+
+\subsection{Step 1.5: Pair-Adaptive Attribute Selection}
+\label{sec:step15}
+
+Step 1.5 addresses a limitation of Step 1: even a well-chosen global attribute
+subset is not equally informative for every pair. For one pair an exact model
+number may already be decisive; for another, the deciding signal might be an author
+mismatch or a subtle title variation, while the model number field is missing or
+uninformative. Step 1.5 replaces one global subset with a \emph{per-pair} subset,
+produced in two stages.
+
+\textbf{Profiling stage.} A small sample of post-blocking candidate pairs (the
+``profile pairs'') is selected \emph{without using ground-truth labels} by one of
+five samplers (described below). For each profile pair, the LLM is asked to score
+every attribute's usefulness for the match/non-match decision on an integer 0--3
+scale (0 = not useful/missing/generic, 3 = highly important or decisive), and the
+raw scores are normalized per pair into an importance vector that sums to one.
+
+\textbf{Transfer stage.} A \texttt{HybridAttributeSelector} is fit on the profiled
+pairs' label-free similarity features (token overlap, edit similarity, exact match,
+semantic similarity, numeric similarity, and an is-numeric indicator, computed per
+attribute) against their LLM-scored importance vectors. It combines two
+sub-models: a Ridge-regression \emph{predictor} that maps a pair's features directly
+to a predicted importance vector, and a cosine-similarity \emph{retriever} that finds
+the $k$ most similar profiled pairs and averages their importance vectors. The two
+signals are combined by a weighted average (0.5/0.5 in the current configuration).
+For every candidate pair (profiled or not), attributes are then selected in
+descending combined-importance order until either a fixed top-$k$ is reached or
+cumulative importance crosses a threshold (0.8 in the current configuration,
+bounded between a minimum and maximum attribute count), with a fallback rule that
+force-includes at least one attribute tagged with a required ``identity'' role
+(e.g.\ title, name, model number) even if the learned ranking would otherwise drop
+it.
+
+The five samplers below differ only in \emph{which} candidate pairs get profiled by
+the LLM; the transfer stage is identical for all of them.
+
+\paragraph{Random sampling.} Profile pairs are drawn uniformly at random from all
+candidate pairs. This is the label-free baseline against which the other samplers
+are compared.
+
+\paragraph{Similarity-stratified sampling.} Candidate pairs are bucketed into
+low/medium/high terciles by their blocking-stage cosine similarity, and profile
+pairs are drawn from each bucket in fixed proportions (60\% medium, 20\% low, 20\%
+high in the current configuration). This intentionally profiles some clearly
+similar pairs, some clearly dissimilar pairs, and a majority of ambiguous
+near-threshold pairs, on the reasoning that ambiguous pairs are where attribute
+importance is hardest to guess and most useful to learn from.
+
+\paragraph{Diversity sampling.} Profile pairs are chosen by farthest-first traversal
+in the label-free pair-feature space: starting from the pair farthest from the
+sample centroid, each subsequent pair is the one that maximizes its minimum
+distance to all previously chosen pairs. This favors broad coverage of distinct
+similarity ``shapes'' (e.g.\ pairs that agree on names but disagree on numbers, versus
+pairs that disagree on everything) over any particular similarity level.
+
+\paragraph{Stratified diversity sampling.} The same low/medium/high similarity
+strata as similarity-stratified sampling are used, but within each stratum, pairs
+are chosen by the same farthest-first diversity rule rather than uniformly at
+random. This is meant to combine both benefits: similarity-level balance and
+within-level feature diversity.
+
+\paragraph{Importance-based sampling.} Pairs are ranked by a label-free
+\emph{importance proxy score} that estimates, without ground truth, how
+informative a pair is likely to be for learning attribute importance:
+$$\text{proxy} = 0.50 \cdot \text{evidence\_contrast} + 0.30 \cdot \text{similarity\_uncertainty} + 0.20 \cdot \text{evidence\_mixedness}$$
+%
+where evidence\_contrast is the standard deviation of per-attribute agreement
+signals (favoring pairs where attributes disagree with each other, rather than all
+pointing the same way), similarity\_uncertainty favors pairs whose blocking
+similarity is far from the sample's typical value, and evidence\_mixedness favors
+pairs whose average per-attribute agreement sits near 0.5 (neither clearly matching
+nor clearly non-matching). The top-scoring pairs (with random tie-breaking) become
+the profile sample.
+
+\section{Results and Findings}
+\label{sec:results}
+
+\subsection{Attribute selection is worth doing}
+
+On the one dataset with a no-selection baseline, both mechanisms beat showing the
+matcher every field, and both spend fewer tokens doing it. This is the premise
+underlying the whole approach, and it holds.
+
+\begin{center}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+Method & Attrs/pair & F1 & Tokens & vs.\ no selection \\
+\midrule
+No selection (\texttt{full}) & 5.00 & 0.7849 & 802{,}477 & --- \\
+Step 1.5, diversity (mean of 6 runs) & 4.00 & 0.9222 & 775{,}828 & $+0.1373$ F1, $-3.3\%$ tokens \\
+Step 1, supervised & 2.00 & \textbf{0.9537} & \textbf{658{,}185} & $+0.1688$ F1, $-18.0\%$ tokens \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Fodors--Zagat, leaking attribute excluded. Note that the simpler mechanism
+wins here: a single global two-attribute subset beats per-pair adaptive selection on
+both accuracy and cost. Section~\ref{sec:supervision} qualifies what that comparison
+actually establishes.
+
+\subsection{The two mechanisms do not operate under the same supervision}
+\label{sec:supervision}
+
+The head-to-head above is not like-for-like, and the difference is large enough to
+change how the result should be read.
+
+Step 1's supervised strategy requires ground-truth labels. It calls
+\texttt{build\_step1\_labeled\_pairs}, which draws its positive examples directly from
+the gold set --- 50 positives and 50 negatives in the configuration used here --- and
+trains a classifier on them. Step 1's LLM-guided strategy needs the same labeled
+sample. Step 1.5, by contrast, consumes \emph{no} labels at all: its profile pairs are
+chosen by label-free samplers and scored by the LLM, never by consulting ground truth.
+
+\begin{center}
+\small
+\begin{tabular}{lrrr}
+\toprule
+Mechanism & Gold labels used & Fodors--Zagat & DBLP--ACM \\
+\midrule
+Step 1, supervised / LLM-guided & 50 pos.\ $+$ 50 neg. & 45.5\% of gold & 2.2\% of gold \\
+Step 1.5, all samplers & \textbf{none} & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+On Fodors--Zagat the asymmetry is severe: the ground truth contains 110 matches, and
+Step 1 supervised is trained on 50 of them. It is shown nearly half the answer key
+before it selects a single attribute.
+
+Two consequences follow. First, Step 1 supervised is better understood as an
+approximate \emph{upper bound} than as a deployable baseline --- in a real
+deployment, the labels it consumes are exactly what the pipeline exists to produce.
+Second, the labeled sample is not held out: those 50 gold pairs remain in the
+evaluation set, so a portion of the Step-1 score is measured on pairs whose
+attribute selection was fitted with knowledge of their labels. On Fodors--Zagat that
+overlap is 45.5\% of the ground truth; on DBLP--ACM, where the gold set is much
+larger, it is 2.2\% and correspondingly less serious.
+
+This does not make the Step-1 numbers wrong, and it does not rescue Step 1.5, which
+still has to demonstrate a win on its own terms. But it reframes the comparison. The
+question Step 1.5 should be judged on is not whether it beats a method trained on the
+answer key --- it is how close a fully label-free method gets to one. Judged that way,
+0.9222 against 0.9537 on Fodors--Zagat with zero supervision is a materially different
+result from the same gap between two comparable methods.
+
+The honest like-for-like baselines for Step 1.5 are Step 1's \emph{manual} and
+\emph{heuristic} strategies, which are also label-free. Neither has current-pipeline
+results on any dataset, which is a real gap in the evaluation
+(Section~\ref{sec:notsettled}).
+
+\subsection{The samplers differ in stability, not in accuracy}
+
+Running every sampler six times on Fodors--Zagat shows that most of the apparent
+ranking is noise. Among the top four, the differences in mean F1 are not
+statistically distinguishable. What \emph{is} distinguishable is the spread: samplers
+that draw their profile pairs randomly vary an order of magnitude more than those
+that derive them deterministically.
+
+\begin{center}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+Sampler & Mean F1 & SD & TP range & Sampling \\
+\midrule
+diversity & 0.9222 & \textbf{0.0021} & 95--96 & deterministic \\
+stratified\_diversity & 0.9152 & 0.0042 & 95--97 & deterministic \\
+similarity\_stratified & 0.9110 & 0.0211 & 87--99 & stochastic \\
+random & 0.8843 & 0.0429 & \textbf{79--96} & stochastic \\
+importance\_based & 0.8356 & 0.0063 & 78--81 & deterministic \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Two things follow. First, a single run of a stochastic sampler is not evidence: one
+\texttt{random} run can land anywhere from 79 to 96 true positives, spanning nearly
+the full gap between the best and worst methods. Second, the pipeline's current
+default, \texttt{similarity\_stratified}, is one of the unstable ones.
+
+The one robust ranking result is negative: \texttt{importance\_based} is reliably the
+worst sampler on this dataset, significantly so against all four alternatives. Since
+its sampling is deterministic, this is not one unlucky draw.
+
+\subsection{Fodors--Zagat contained a label leak}
+\label{sec:leak}
+
+The \texttt{class} attribute is the ground-truth cluster identifier --- it agrees on
+110 of 110 gold pairs and is unique within each table. Step-1 supervised selection had
+been choosing it, which invalidated that result entirely. All Fodors--Zagat numbers
+here come from re-runs with the attribute excluded. DBLP--ACM was checked and is
+clean; Amazon--Walmart's \texttt{original\_id} was checked and does not leak. The leak
+was found by manual inspection; the pipeline has no automated guard.
+
+\subsection{The selection policy breaks on wide schemas}
+
+Step 1.5 keeps attributes until their cumulative importance reaches 0.8, capped at
+five. On Amazon--Walmart's thirteen attributes this target is unreachable: using the
+LLM's own importance scores, the top five carry 0.612 of the mass on average and never
+more than 0.789, so reaching 0.8 would need 7.7 attributes. The cap therefore binds
+for 100\% of pairs by construction, selection size is a constant 5.0, and the run
+tests nothing about adaptive selection. This is a property of normalizing importance
+over a wide schema, not a defect in the selector.
+
+\section{Two Defects Found in the Measurement Apparatus}
+\label{sec:defects}
+
+Both have been fixed and covered by regression tests. Neither fix was in place for any
+result above.
+
+\subsection{Prompt field order was an uncontrolled variable}
+
+The selector emitted its chosen subset in predicted-importance order, and that order
+reached the prompt verbatim. Because predicted importance shifts with the profile
+sample, reseeding permuted the prompt even when it selected exactly the same fields.
+Conditioning every cross-seed comparison on DBLP--ACM:
+
+\begin{center}
+\small
+\begin{tabular}{lr}
+\toprule
+Condition & Matcher changes its answer \\
+\midrule
+Same attribute set, same order & \textbf{0.10\%} \\
+Same attribute set, different order & \textbf{5.44\%} \\
+Different attribute set & 1.23\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Reordering the same fields changes the answer 54 times more often than re-sending an
+identical prompt --- and more often than changing which fields are shown. Every
+Step-1.5 run has therefore been varying two things at once, and on this dataset the
+unintended one is the stronger. Both selection stages now sort into table-column
+order.
+
+\subsection{An unset token cap aborted runs while credit remained}
+
+The LLM client never set \texttt{max\_tokens}, so every request defaulted to the
+model's 65{,}535-token output ceiling. OpenRouter reserves credit against that
+declared ceiling, not against actual use, and returns HTTP 402 when the balance cannot
+cover it. The matcher in fact emits \emph{exactly one} completion token per call
+(13{,}080 of 13{,}080 on DBLP--ACM; 2{,}665 of 2{,}665 on Fodors--Zagat). Requests were
+reserving roughly four orders of magnitude more budget than they used, and nine runs
+were destroyed this way. Explicit caps are now sent: 8 tokens for matching, 512 for
+profiling.
+
+A related hazard remains partly open: a failed LLM call is scored as a non-match and
+the run still writes complete metrics, so a wholly failed run reports F1 $=0.0000$ and
+a partly failed one reports a plausible-looking number. The sweep driver now discards
+these and halts; a directly launched run does not, and must be checked.
+
+\section{What Is Not Settled}
+\label{sec:notsettled}
+
+\textbf{The sampler ranking, on either dataset.} The DBLP--ACM figures are single runs
+at one seed. Reseeding the one sampler that was successfully re-run moves F1 across
+0.8847--0.9258, a spread of 0.0411 --- wider than the 0.0370--0.0539 gap the
+single-seed table attributes to sampler choice. The headline result that
+\texttt{importance\_based} wins on DBLP--ACM is therefore withdrawn pending repeated
+seeds: not contradicted, but unsupported. Replicate noise at fixed configuration is
+only 10 true positives, so the result may well survive; it has simply not been shown.
+
+The attempted sweep completed five of thirteen runs before the budget ran out.
+
+\textbf{Cross-generation comparability.} The canonical-order fix means no pre-fix run
+may be compared against a post-fix run. The Step-1.5 tables need regenerating in full
+rather than extending.
+
+\textbf{Whether Step 1.5 beats a label-free competitor.} Every Step-1 result available
+comes from the supervised strategy, which consumes ground-truth labels
+(Section~\ref{sec:supervision}). The two label-free Step-1 strategies, \emph{manual}
+and \emph{heuristic}, have no current-pipeline results on any dataset, so the only
+comparison the evidence supports is against a supervised method --- which Step 1.5 is
+not, and is not trying to be. Running those two baselines is cheap and would settle
+the central question of the thesis far more directly than another sampler sweep.
+
+\section{Status and Cost to Complete}
+
+Work is halted for a non-technical reason: the OpenRouter account is exhausted, at
+\$95.00 provisioned against \$95.25 consumed --- \$0.25 overdrawn --- and all calls
+return HTTP 402. Costs below use \$0.31 per million tokens, derived from this
+project's own billing (48.1\,M tokens over 46 runs in the past week against \$14.90
+charged) rather than from list pricing.
+
+\begin{center}
+\small
+\begin{tabular}{lrrr}
+\toprule
+Work item & Tokens & Est.\ cost & Runtime \\
+\midrule
+Step-1 \emph{manual} + \emph{heuristic}, both datasets & 9\,M & \$2.79 & 1.1\,h \\
+Fodors--Zagat Step-1 baseline (re-run) & 0.7\,M & \$0.22 & 4\,min \\
+Fodors--Zagat sampler sweep, $5\times5$ & 20\,M & \$6.19 & 1.7\,h \\
+DBLP--ACM \texttt{full} and Step-1 baselines & 7.5\,M & \$2.32 & 55\,min \\
+DBLP--ACM sampler sweep, $5\times5$ & 98\,M & \$30.35 & 8.2\,h \\
+\midrule
+\textbf{Total to complete the comparison} & \textbf{135\,M} & \textbf{\$41.88} & \textbf{12\,h} \\
+\midrule
+Amazon--Walmart, single run (blocked on policy) & 60\,M & \$18.58 & 4.3\,h \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Amazon--Walmart is blocked on the selection policy rather than on budget: until the
+cumulative-importance threshold is made scale-free, a run on its schema saturates and
+tests nothing. Spending on it first would buy another uninterpretable result.
+
+\section{Assessment}
+
+The pipeline works and attribute selection demonstrably helps. The uncomfortable
+findings are that the simpler mechanism currently posts the better number --- a global
+two-attribute subset beats per-pair adaptive selection on Fodors--Zagat, on both
+accuracy and cost --- and that the sampler comparison, which was the strongest
+apparent result, has shrunk under each round of scrutiny: first when a label leak was
+removed, then when repeated seeds showed the ranking was inside the noise, and finally
+when prompt field order proved to be a stronger driver than attribute choice.
+
+That first finding needs qualifying rather than conceding. The two mechanisms are not
+solving the same problem: Step 1's supervised strategy is trained on 50 gold matches,
+which on Fodors--Zagat is 45.5\% of the entire answer key, while Step 1.5 uses no
+labels at all (Section~\ref{sec:supervision}). A method given half the ground truth
+should be expected to win. The result that matters is the size of the remaining gap
+--- 0.9222 against 0.9537, with zero supervision --- and that gap is small enough to
+be worth defending. Establishing this properly requires the two label-free Step-1
+strategies, manual and heuristic, which have never been run on the current pipeline.
+
+The rest of what survives is worth keeping. Attribute selection beats no selection by
+a wide margin. One sampler is reliably bad. And the samplers separate cleanly by
+stability rather than by mean accuracy, which reframes what the contribution should be
+measured on --- a more defensible claim than a ranking that reseeding erases.
+
+The immediate need is API credit, approximately \$42, to regenerate the Step-1.5
+comparisons under the corrected pipeline, plus the two label-free Step-1 baselines
+that would make the central comparison fair.
+
+\end{document}

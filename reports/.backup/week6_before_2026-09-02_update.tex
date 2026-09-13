@@ -1,0 +1,663 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{amsmath}
+
+\setlength{\emergencystretch}{2em}
+
+\title{Weekly Report: Week 6}
+\author{}
+\date{2026-09-02}
+
+\begin{document}
+\maketitle
+
+All results use the matcher
+\texttt{deepseek-\allowbreak v4-\allowbreak flash-\allowbreak 0731} and the embedding
+model \texttt{bge-\allowbreak large-\allowbreak en-\allowbreak v1.5}. Every comparison within a dataset is scored over an identical
+candidate set: 2{,}665 pairs on Fodors--Zagat, 13{,}080 on DBLP--ACM, 88{,}296 on
+Amazon--Walmart.
+
+\section{Pipeline Overview}
+
+The pipeline runs in five stages, each timed and recorded in a per-run JSON summary under
+\texttt{logs/<dataset>/runs/}.
+
+\textbf{Load and normalize.} Both tables and the ground truth are read, ID columns are
+dropped, and every remaining field is normalized: HTML entity references are decoded, text
+is Unicode-decomposed with combining marks stripped, and address and directional
+abbreviations are standardized. This matters more than it appears: \texttt{ACM.csv} stores
+461 HTML entity references (\texttt{\&\#246;}, \texttt{\&mdash;}) where \texttt{DBLP.csv}
+stores none, so without decoding, the same author name is two unrelated strings across the
+two sources.
+
+\textbf{Embed and block.} Each attribute column is encoded independently with SentenceBERT,
+the column vectors are concatenated and L2-normalized into one embedding per record, and
+multi-probe locality-sensitive hashing retrieves the top-$k$ most similar Table-B candidates
+for every Table-A record. On DBLP--ACM this reduces 6{,}001{,}104 possible pairs to 13{,}080
+candidates while retaining all 2{,}224 ground-truth matches.
+
+\textbf{Step 1 --- global tuple condensation (optional).} One attribute subset is chosen
+once for the whole dataset and applied to every record. The tables may optionally be
+re-blocked on the condensed attributes; see Section~\ref{sec:reblock}.
+
+\textbf{Step 1.5 --- pair-adaptive attribute selection (optional).} A small sample of
+candidate pairs is profiled by the LLM for per-attribute importance, and a hybrid
+predictor/retriever model transfers a \emph{different} attribute subset to every candidate
+pair. Blocking is unchanged, so the candidate set is identical to the no-selection baseline.
+
+\textbf{Match.} One LLM call decides Yes/No per candidate pair, using only the attributes
+selected for that pair.
+
+\textbf{Metrics and logging.} Precision, recall, and F1 are computed end-to-end, against all
+ground-truth matches, so pairs lost at blocking count against recall.
+
+\section{Methodology}
+\label{sec:methodology}
+
+\subsection{Step 1.5: Pair-Adaptive Attribute Selection}
+
+Step~1.5 has a profiling stage and a transfer stage.
+
+\textbf{Profiling.} A label-free sampler selects a small set of candidate pairs (20 on
+Fodors--Zagat, 50 on DBLP--ACM) and the LLM is asked, for each, which attributes matter for
+deciding whether the two records describe the same entity. Ground truth is not consulted at
+any point. The \texttt{diversity} sampler is used throughout this report, holding the
+sampler fixed so that other variables can be read.
+
+\textbf{Transfer.} For every candidate pair, six cheap similarity features are computed per
+attribute --- token overlap, edit similarity, exact match, semantic similarity, numeric
+similarity, and a numeric-type indicator --- without calling the LLM. Two models then
+predict per-attribute importance from those features: a Ridge regressor fit on the profiled
+pairs, and a nearest-neighbour retriever that averages the importance vectors of the five
+most feature-similar profiled pairs. Their outputs are blended equally and normalized to sum
+to one, and a selection rule decides how many of the ranked attributes to keep.
+
+The profiling stage costs about 1\% of a run's tokens. Its purpose is to buy a rule that can
+be applied to the remaining 99\% without further LLM calls.
+
+\subsection{Two Ways to Elicit Importance}
+\label{sec:scoring}
+
+The profiling prompt is one of the two variables this report isolates. Two formulations were
+compared, identical in framing and guardrails and differing only in the answer requested.
+
+\textbf{Ordinal.} The LLM assigns each attribute an integer score from 0 (not useful) to 3
+(decisive), scoring each attribute independently.
+
+\textbf{Decisive.} The LLM returns the smallest subset of attributes sufficient to make the
+decision, weighing attributes against one another in a single judgement.
+
+The motivation for the second formulation was that the recorded 0--3 scores were not being
+used discriminatively. Aggregated over all runs, DBLP--ACM used score 0 on 1\% of
+judgements, collapsing a four-point scale to three; Fodors--Zagat used score 3 on 55\%. An
+importance vector that is nearly flat cannot express that one attribute matters more than
+another, whatever selection rule consumes it.
+
+\subsection{How Many Attributes to Keep}
+\label{sec:policy}
+
+Profiling and transfer produce a ranked importance vector per pair. A separate rule turns
+that ranking into a subset, and it is the second variable isolated here.
+
+\textbf{Cumulative} keeps attributes in descending importance until their shares sum past a
+fixed target, by default 0.8. It is the pipeline's historical default and is not scale-free:
+importance is normalized to sum to one, so on a wide schema each attribute's share shrinks
+and a fixed target becomes unreachable. On Amazon--Walmart's 13 attributes the 0.8 target
+needs 7.7 attributes on average against a cap of 5, so the cap binds for every pair and the
+rule cannot express ``this pair needs fewer fields'' at all.
+
+\textbf{Gap} cuts at the largest drop in the ranked importance profile. It has no threshold
+to tune and does not saturate on any of the three schemas.
+
+Both rules are subject to a floor and a cap on the number of attributes kept. The floor was
+2 by default and is set to 1 wherever a run is allowed to reduce a pair to a single
+attribute.
+
+\subsection{Restricting Selection to Attributes Carrying Evidence}
+\label{sec:mask}
+
+An attribute both records leave blank supports no decision either way, but the transfer
+model can still rank it first: its features are computed from two empty strings and the
+profiling signal that trained the ranking came from pairs where the field was populated.
+Selecting it hands the matcher a prompt whose only content is two blank fields.
+
+Before any rule is applied, each pair is therefore given a mask marking the attributes
+present on both sides. Masked attributes have their predicted importance set to zero, the
+vector is renormalised over the remainder, and the ranking the rule reads contains only
+usable attributes; if a pair has none, the unmasked ranking is used unchanged rather than
+selecting nothing.
+
+The correction is confined to wide, sparsely populated schemas. On Amazon--Walmart it binds
+for 23{,}439 of 88{,}296 pairs (26.5\%) under decisive elicitation, and every affected pair
+had been selecting a field blank on at least one side. On DBLP--ACM it binds for 5 pairs of
+13{,}080 and leaves F1 unchanged at 0.9397, so the results of Section~\ref{sec:dblp} stand
+as reported. Ordinal elicitation is unaffected on both datasets: it never ranked a blank
+attribute first to begin with, and its selections are byte-identical before and after.
+
+\subsection{Hyperparameters}
+\label{sec:hyper}
+
+Everything below is held fixed across every run reported here unless a result explicitly
+varies it. The two quantities that were varied deliberately --- the elicitation format and
+the selection rule --- are the subject of Sections~\ref{sec:dblp} and~\ref{sec:rule}.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+Stage & Parameter & Value \\
+\midrule
+Embedding   & model                       & \texttt{BAAI/bge-large-en-v1.5} \\
+            & encoding                    & per column, concatenated, L2-normalised \\
+\midrule
+Blocking    & scheme                      & multi-probe LSH, random hyperplanes \\
+            & tables / planes / flips     & 15 / 8 / 1 (DBLP--ACM), 10 / 4 / 1 (Amazon--Walmart) \\
+            & top-$k$ per Table-A record  & 5 (DBLP--ACM), 4 (Amazon--Walmart) \\
+\midrule
+Profiling   & sampler                     & \texttt{diversity} \\
+            & sample size                 & 50 candidate pairs \\
+            & elicitation                 & \texttt{decisive} (\texttt{ordinal} where stated) \\
+            & concurrency                 & 4 workers \\
+\midrule
+Transfer    & predictor                   & Ridge regression over 6 features per attribute \\
+            & retriever                   & cosine $k$-NN, $k = 5$ \\
+            & fusion                      & \texttt{weighted\_average}, 0.5 / 0.5 \\
+\midrule
+Selection   & rule                        & \texttt{gap} (no threshold) \\
+            & $k$ bounds                  & $\min = 1$, $\max = 5$ \\
+            & cumulative target           & 0.8 (only for the \texttt{cumulative} rule) \\
+            & ratio $\lambda$             & 1.5 (only for the \texttt{ratio} rule) \\
+            & required roles              & \texttt{identity} \\
+            & attribute order in prompt   & canonical (table-column order) \\
+\midrule
+Matcher     & model                       & \texttt{deepseek/deepseek-v4-flash-0731} \\
+            & temperature                 & 0 \\
+            & max tokens                  & 256 \\
+            & reasoning                   & disabled \\
+            & concurrency                 & 8 workers \\
+\midrule
+Seeds       & pipeline / blocking         & 42 / 42 \\
+\bottomrule
+\end{tabular}
+\caption{Hyperparameters. Attribute \emph{roles} are assigned per dataset from the column
+name: \texttt{title} and \texttt{modelno} are \texttt{identity}, \texttt{authors} and
+\texttt{brand} \texttt{strong\_support}, \texttt{venue}, \texttt{year} and
+\texttt{category} \texttt{context}, and the remaining Amazon--Walmart columns
+\texttt{other}. Only \texttt{identity} is required, which is what forces at least one
+identifying field into every selection.}
+\end{table}
+
+\section{Experimental Design}
+\label{sec:design}
+
+\subsection{Why Comparisons Are Paired}
+\label{sec:paired}
+
+The matcher LLM is not deterministic, and on these datasets its variation is large enough to
+swamp the effects being measured. Running the no-selection baseline twice on Fodors--Zagat,
+with identical prompts and identical attributes, produced F1 of 0.8917 and 0.9596 --- a gap
+of 0.068, from 19 of 2{,}665 answers changing, 18 of them from Yes to No. Precision moved
+from 0.823 to 0.947 while recall was unchanged.
+
+The same measurement on DBLP--ACM gives a much smaller floor: two independent draws of the
+no-selection baseline produced F1 of 0.8706 and 0.8613, a gap of 0.0093. This is expected ---
+DBLP--ACM has 2{,}224 ground-truth matches against Fodors--Zagat's 110, so the same absolute
+number of flipped answers perturbs the metrics far less.
+
+Comparing two methods by their F1 values from separate runs therefore measures the matcher's
+variance more than it measures the methods. Two consequences follow.
+
+First, the matcher response cache is enabled for all comparisons. Where two methods select
+the same attributes for a pair, the pair yields one shared answer and cannot contribute a
+spurious difference. Section~\ref{sec:mechanism} shows this working: across the 9{,}803 pairs
+where two very different methods happened to select the same single attribute, they recorded
+identical false-positive counts.
+
+Second, methods are compared by McNemar's test on the pairs where they actually differ,
+rather than by comparing aggregate F1. This is a paired test on the same candidate set and
+the same matcher draw, and it is the only comparison in this report that carries a
+significance claim.
+
+A caveat this design imposes: because repeated runs of one configuration replay the cache,
+they are not independent measurements and their standard deviation is meaningless.
+Replication across seeds was dropped in favour of the paired design.
+
+\subsection{Holding the Candidate Set Fixed Across Methods}
+\label{sec:reblock}
+
+Step~1.5 leaves blocking untouched, so its candidate set is identical to the no-selection
+baseline. Step~1 condenses the record and can optionally re-block on the condensed
+attributes, which would change which pairs are compared. It is therefore run with
+re-blocking disabled (\texttt{--step1-no-reblock}) throughout, so that every configuration is
+scored over the same 13{,}080 candidate pairs containing the same 2{,}224 ground-truth
+matches, and attribute choice is the only difference between them.
+
+\section{Results}
+
+\subsection{Fodors--Zagat is saturated}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrrrr}
+\toprule
+Method & Attrs/pair & TP & FP & FN & F1 & Precision & Recall \\
+\midrule
+Step 1.5, ordinal      & 4.00 & 108 & 6 & 2 & \textbf{0.9643} & 0.9474 & \textbf{0.9818} \\
+Step 1.5, decisive     & \textbf{2.68} & 106 & \textbf{4} & 4 & 0.9636 & \textbf{0.9636} & 0.9636 \\
+No selection           & 5.00 & 107 & 6 & 3 & 0.9596 & 0.9469 & 0.9727 \\
+Step 1, supervised     & 2.00 & 106 & 5 & 4 & 0.9593 & 0.9550 & 0.9636 \\
+\bottomrule
+\end{tabular}
+\caption{Fodors--Zagat, 110 ground-truth matches, \texttt{class} excluded.}
+\end{table}
+
+Every pairwise McNemar test returns $p = 1.00$; the largest disagreement between any two
+methods is 9 pairs out of 2{,}665. Doing nothing already recovers 107 of 110 matches, so
+there is no headroom for a method to distinguish itself, and with 110 matches the matcher's
+own instability moves F1 further than any method does. The defensible claim here is a 46\%
+reduction in attributes at unchanged accuracy.
+
+\subsection{DBLP--ACM separates the methods}
+\label{sec:dblp}
+
+\begin{table}[h]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llrrrrrrr}
+\toprule
+Method & Rule & Attrs/pair & TP & FP & FN & F1 & Precision & Recall \\
+\midrule
+Step 1.5, decisive & gap            & 1.42 & 2197 & \textbf{255} & 27 & \textbf{0.9397} & \textbf{0.8960} & 0.9879 \\
+Step 1, supervised (200 labels) & --- & 1.00 & 2198 & 339 & 26 & 0.9233 & 0.8664 & 0.9883 \\
+Step 1.5, decisive & cumulative 0.8 & 2.24 & 2214 & 535 & 10 & 0.8904 & 0.8054 & 0.9955 \\
+No selection       & ---            & 4.00 & 2216 & 651 &  8 & 0.8706 & 0.7729 & \textbf{0.9964} \\
+Step 1.5, ordinal  & cumulative 0.8 & 3.77 & 2215 & 699 &  9 & 0.8622 & 0.7601 & 0.9960 \\
+Step 1, supervised (10 labels) & --- & 2.00 & 2211 & 739 & 13 & 0.8547 & 0.7495 & 0.9942 \\
+\bottomrule
+\end{tabular}}
+\caption{DBLP--ACM, 2{,}224 ground-truth matches.}
+\end{table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrl}
+\toprule
+Comparison (A vs.\ B) & A right & B right & $p$ \\
+\midrule
+Decisive/gap vs.\ no selection            & 527 & 150 & $5.2\times10^{-50}$ \\
+Decisive/gap vs.\ supervised (200)        & 112 &  29 & $1.0\times10^{-12}$ \\
+Decisive/gap vs.\ decisive/cum.\ 0.8      & 375 & 112 & $3.5\times10^{-34}$ \\
+Supervised (200) vs.\ decisive/cum.\ 0.8  & 389 & 209 & $1.6\times10^{-13}$ \\
+Decisive/cum.\ 0.8 vs.\ no selection      & 468 & 350 & $4.2\times10^{-5}$ \\
+Decisive/cum.\ 0.8 vs.\ ordinal           & 425 & 258 & $1.7\times10^{-10}$ \\
+No selection vs.\ ordinal                 & 135 &  86 & $1.2\times10^{-3}$ \\
+Ordinal vs.\ supervised (10)              & 497 & 453 & $0.16$ \\
+\bottomrule
+\end{tabular}
+\caption{McNemar tests over the pairs on which two methods disagree.}
+\end{table}
+
+The best configuration reaches F1 0.9397 on 1.42 of 4 attributes per pair, beating both no
+selection and a global baseline trained on 400 labelled pairs, while using no labels
+itself. Every figure in this table is one draw of the matcher, recorded between 12 and 19
+August; Section~\ref{sec:draws} repeats the two headline rows and shows that the absolute
+values do not reproduce two weeks later while the ordering does.
+
+Recall is close to constant across the table (0.988--0.996) while precision spans
+0.750--0.896. Attribute selection does not help the matcher find matches it was missing; it
+stops the matcher asserting matches that are not there. The one cost appears at the
+aggressive end, where the configurations showing barely more than one attribute give up
+18--19 of 2{,}224 matches.
+
+Holding the rule fixed, the decisive formulation beats no selection
+($p = 4.2\times10^{-5}$) while the ordinal formulation is significantly \emph{worse} than
+no selection ($p = 1.2\times10^{-3}$). Only the profiling question differs between them.
+Ordinal also barely selects, keeping all four attributes on 76.8\% of pairs. The attribute
+decisive learns to discard is \texttt{venue}: the two sources render it incompatibly
+(\texttt{"SIGMOD Record"} against \texttt{"The VLDB Journal --- The International Journal
+on\ldots"}), so venue disagreement is evidence of formatting, not of non-identity. Scored in
+isolation it looks moderately informative, which is why ordinal keeps it.
+
+\subsection{The selection rule matters as much as the elicitation}
+\label{sec:rule}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrr}
+\toprule
+Rule & Attrs/pair & FP & FN & F1 & \texttt{title} only \\
+\midrule
+cumulative 0.8 (default) & 2.24 & 535 & 10 & 0.8904 &  0.0\% \\
+cumulative 0.6           & 1.66 & 434 & 13 & 0.9082 & 34.5\% \\
+cumulative 0.5           & 1.27 & 293 & 20 & 0.9337 & 73.2\% \\
+cumulative 0.4           & 1.18 & 275 & 26 & 0.9359 & 82.7\% \\
+gap (no threshold)       & 1.42 & \textbf{255} & 27 & \textbf{0.9397} & 74.9\% \\
+\midrule
+Global baseline, fixed \texttt{[title]} & 1.00 & 339 & 26 & 0.9233 & 100.0\% \\
+\bottomrule
+\end{tabular}
+\caption{DBLP--ACM, decisive profiling throughout, varying only the selection rule.}
+\end{table}
+
+At the default target of 0.8, pair-adaptive selection \emph{loses} to the global baseline
+($p = 1.6\times10^{-13}$); at 0.4 it wins ($66/2$, $p = 1.6\times10^{-17}$). The comparison
+between adaptive and global selection turned on an untuned hyperparameter rather than on
+the methods.
+
+The best configuration is at neither extreme: showing everything (4.00 attributes) and
+showing one fixed attribute (1.00) are both beaten by rules showing roughly 1.2--1.4.
+Targets 0.4 and 0.5 are statistically indistinguishable ($55/67$, $p = 0.32$), so this is a
+plateau rather than one fortunate value, while the steps above them are individually
+significant. The \texttt{gap} rule is the practically important row: it has no threshold, so
+nothing about it was chosen by inspecting these results, and it reaches the top of the range
+anyway. Its margin over the best hand-tuned target is thin ($50/31$, $p = 0.045$) and should
+not be claimed as superiority --- the defensible claim is that it matches a tuned threshold
+without requiring one.
+
+\subsection{Why adaptation beats a fixed subset}
+\label{sec:mechanism}
+
+The global baseline reduces every record to \texttt{title}, which is also what the adaptive
+method chooses for three quarters of pairs. Comparing them isolates adaptation itself,
+holding the attribute vocabulary fixed.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+Pair group & Pairs & FP, adaptive & FP, fixed \texttt{[title]} \\
+\midrule
+Adaptive also chose \texttt{[title]} & 9{,}803 & 118 & 118 \\
+Adaptive chose more                  & 3{,}277 & \textbf{137} & 221 \\
+\midrule
+\quad \texttt{[title, authors, year]} & 2{,}257 & 101 & 146 \\
+\quad \texttt{[title, year]}          &    841 &  \textbf{13} &  58 \\
+\quad \texttt{[title, authors]}       &    179 &  23 &  17 \\
+\bottomrule
+\end{tabular}
+\caption{DBLP--ACM, all 13{,}080 pairs: decisive under \texttt{gap} against the 200-label
+global baseline.}
+\end{table}
+
+Where the two select the same attribute they produce identical results --- 118 false
+positives each --- which is what the shared cache guarantees and which confirms the
+comparison is clean. The entire gain comes from the 3{,}277 pairs where the adaptive method
+kept more, cutting false positives from 221 to 137. The clearest single effect is the 841
+pairs given \texttt{[title, year]}, where false positives fall from 58 to 13: titles similar
+enough to mislead a title-only matcher, with the year settling the question. A global method
+cannot express this, because adding \texttt{year} everywhere is close to what the
+cumulative-0.8 configuration does, and it costs more elsewhere than it saves here.
+
+\subsection{The matcher is not a fixed quantity}
+\label{sec:draws}
+
+Every number reported above is a single call of the matcher over each pair. That is only a
+sound way to report a result if repeating the run reproduces it, and it does not.
+OpenRouter serves one model slug from several providers that differ in quantization, so two
+fresh runs of the same configuration over the same pairs are two different measurements.
+Re-running the two headline configurations three times each, with the response cache
+disabled so that each run is an independent draw rather than a replay, gives:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrr}
+\toprule
+Configuration & Draw 1 & Draw 2 & Draw 3 & Mean & Range \\
+\midrule
+Step 1.5, decisive (\texttt{gap}) & 0.9228 & 0.8886 & 0.9151 & \textbf{0.9088} & 0.0342 \\
+No selection                      & 0.7632 & 0.7006 & 0.7047 & 0.7228 & 0.0626 \\
+\bottomrule
+\end{tabular}
+\caption{DBLP--ACM F1 over three independent matcher draws per configuration, all run
+26--27 August with \texttt{--disable-matcher-cache}. Same model slug, same prompt hash,
+same attribute counts as the runs in Table~1.}
+\label{tab:draws}
+\end{table}
+
+Three things follow, and they point in different directions.
+
+\textbf{The comparison is robust and larger than first reported.} The two ranges do not
+overlap: the worst adaptive draw, 0.8886, exceeds the best no-selection draw, 0.7632. The
+separation between the means is 0.186, against the 0.069 that the single draws of Table~1
+suggested. The paired tests within each draw agree, giving adaptive selection 1{,}217, 1{,}689
+and 1{,}677 uniquely correct pairs against 207, 341 and 224 for no selection
+($p < 10^{-170}$ in all three). The finding replicates.
+
+\textbf{The absolute values do not reproduce.} No-selection F1 was 0.8706 in mid-August and
+averages 0.7228 a fortnight later, with precision falling from 0.7729 to 0.5674. The cause
+is visible in the raw counts: against 2{,}224 true matches the matcher asserted 2{,}867 in
+August and 3{,}591--4{,}111 now. It has become markedly more willing to answer Yes, and the
+configuration that shows it more fields suffers more for it. Nothing in this pipeline
+changed --- the model slug, the prompt hash, the attribute counts and the token counts are
+identical across the two periods. Any single-draw F1 in this report should therefore be read
+as a measurement of one matcher on one date, not as a property of the method, and a reader
+reproducing these runs today should expect the levels to differ while the ordering holds.
+
+\textbf{Condensation halves the variance.} The adaptive configuration varies by 0.034 across
+draws and no selection by 0.063. This was not something the method was designed to do, but it
+follows from the same mechanism as the accuracy gain: most of what provider variation can
+change is a borderline judgement on a field that carries little evidence, and a pair reduced
+to 1.42 attributes has fewer such fields to be swayed by. Stability under a drifting
+serving stack is a second, independent argument for condensing, and one that matters more in
+deployment than in a benchmark.
+
+\subsection{Amazon--Walmart: the wide-schema regime}
+\label{sec:amazon}
+
+\begin{table}[h]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llrrrrrrrr}
+\toprule
+Method & Rule & Attrs/pair & Tokens & TP & FP & FN & F1 & Precision & Recall \\
+\midrule
+No selection (\texttt{full}) & --- & 12.00 & 1035 & 1010 & 1018 & 133 & \textbf{0.6370} & 0.4980 & 0.8836 \\
+Step 1.5, decisive & \texttt{gap}, $k\!\ge\!1$ & 1.34 & \textbf{248} & 914 & \textbf{919} & 229 & 0.6142 & \textbf{0.4986} & 0.7997 \\
+Step 1.5, decisive & \texttt{cumulative} & 2.24 & 286 & 954 & 1273 & 189 & 0.5662 & 0.4284 & 0.8346 \\
+Step 1.5, decisive & \texttt{gap}, $k\!\ge\!2$ & 2.39 & 316 & 961 & 1413 & 182 & 0.5465 & 0.4048 & 0.8408 \\
+Step 1.5, ordinal & \texttt{gap}, $k\!\ge\!1$ & 2.18 & 382 & 979 & 1494 & 164 & 0.5412 & 0.3956 & 0.8565 \\
+Step 1.5, decisive & \texttt{gap}, $k\!=\!5$ & 5.00 & 524 & 934 & 3238 & 209 & 0.3515 & 0.2239 & 0.8171 \\
+Step 1, supervised & \multicolumn{9}{l}{did not run: a fixed cut-off selected no attributes} \\
+\bottomrule
+\end{tabular}}
+\caption{Amazon--Walmart, 1{,}143 ground-truth matches, blocking completeness 0.9143.
+Metrics are end-to-end, so false negatives include the 98 matches blocking did not retain.
+All Step-1.5 rows use the evidence mask of Section~\ref{sec:mask}. The \texttt{cumulative}
+row runs with the attribute cap removed, without which the rule cannot reach its target on
+this schema at all.}
+\end{table}
+
+This is the benchmark with headroom. Baseline precision is 0.4980 here against 0.7729 on
+DBLP--ACM and 0.9469 on Fodors--Zagat --- close to half the asserted matches are wrong. It
+is also where condensation is worth most: 1{,}035 prompt tokens per pair at the full
+representation, against 306 on DBLP--ACM.
+
+\textbf{Adaptive selection matches the baseline's per-pair accuracy at a quarter of the
+prompt.} Over the 88{,}296 shared candidate pairs the baseline is uniquely correct on 804
+and decisive selection on 807, a paired difference of three pairs in nearly ninety thousand
+($p = 0.96$). The two are, on this evidence, equally accurate matchers, and one of them
+reads 248 tokens per pair rather than 1{,}035.
+
+F1 nonetheless favours the baseline, 0.6370 to 0.6142, and the two statements are
+consistent rather than contradictory: equal error \emph{counts} need not mean equal F1 when
+the errors fall differently. Precision is identical to four decimal places (0.4986 against
+0.4980); the entire F1 gap is recall, 0.7997 against 0.8836. With only 1{,}143 matches among
+88{,}296 pairs, a false negative costs recall far more than a false positive costs precision,
+so an even trade of one for the other still moves F1. Which of the two numbers matters is an
+application question, not a methodological one: a deployment paying per token and rescoring
+survivors should read the paired test, while one that must not miss matches should read F1.
+
+\textbf{No fixed rule recovers the difference; every one tried makes it worse.} The recall
+gap sits entirely in pairs condensed to a single attribute, which suggested raising the
+floor. Doing so does raise recall --- false negatives fall from 229 to 182 --- but precision
+collapses from 0.4986 to 0.4048 and F1 with it. Splitting by what the unconstrained selector
+had chosen isolates the cause exactly: on the 27{,}402 pairs it had already given two or more
+attributes nothing changes, false positives 150 against 150, while on the 60{,}894 pairs it
+had condensed to one, forcing a second attribute buys 47 true positives at the price of 494
+false ones. The attribute forced in is \texttt{brand} for 33{,}823 of them, and two different
+products from one manufacturer agree on it; the floor injects apparent corroboration where
+the selector had correctly found none. A second rule reaching a similar width by an unrelated
+mechanism --- \texttt{cumulative} with its cap removed, 2.24 attributes --- reproduces the
+same collapse (precision 0.4284), so this is a property of the two-attribute region on this
+schema rather than an artefact of the floor. Both are significant against the unconstrained
+selector: $p = 3.5\times10^{-27}$ and $p = 1.3\times10^{-19}$.
+
+\textbf{The interval between those two widths is worse than either end of it.} Forcing five
+attributes per pair --- requested as six, capped at five --- collapses precision to 0.2239
+and F1 to 0.3515, far below both the 1.34-attribute configuration and no selection. It loses
+to no selection on 2{,}882 pairs against 586, and to the unconstrained selector on 3{,}028
+against 729 ($p$ below double precision in both). Precision as a function of width is thus
+not merely non-monotone but sharply valleyed: 0.4986 at 1.34 attributes, 0.4048 at 2.39,
+0.2239 at 5, and 0.4980 again at 12.
+
+Counting what the five-attribute prompts actually contain explains the shape. The subset is
+led by \texttt{title} (100\% of pairs), \texttt{brand} (90.6\%), \texttt{modelno} (71.1\%)
+and \texttt{longdescr} (61.5\%) --- descriptive text, on which distinct products routinely
+agree. The fields that let a matcher refuse appear rarely: \texttt{price} in 26.1\% of pairs
+and \texttt{shipweight} in 0.7\%, because importance ranks them low and the cut removes them
+first. Five attributes therefore supply abundant corroboration and almost no grounds for
+contradiction, which is precisely the composition that manufactures false positives. At
+twelve attributes the numeric fields return and precision recovers.
+
+The practical consequence is that this schema offers no cheap middle. Either condense hard,
+to 1.34 attributes for a quarter of the tokens and no loss of per-pair accuracy, or show
+everything. Every intermediate width tested is worse than both.
+
+\textbf{Elicitation format replicates across datasets; the schema effect does not.} Decisive
+beats ordinal here as it did on DBLP--ACM, 1{,}230 pairs to 806 ($p = 5.0\times10^{-21}$).
+That ordering is the one finding in this section that carries over unchanged.
+
+The supervised baseline could not be run here. Its importance scores are normalised to sum
+to one and it retained attributes above a fixed 0.3 cut-off, which on a 12-attribute schema
+no attribute reaches --- the mean share is $1/12$. It selected the empty subset and aborted.
+This is the same scale-free defect as the cumulative rule of Section~\ref{sec:rule}, in a
+different component.
+
+One structural finding came out of preparing this dataset. The \texttt{original\_id} field
+is a per-table row counter running $1\ldots22{,}074$ and $1\ldots2{,}554$, sharing no key
+across the tables. Excluding it raised pair completeness from 0.9099 to 0.9143, recovering
+five ground-truth pairs. Because each column is encoded independently and the column vectors
+are concatenated, that field occupied a full block of every record embedding and displaced
+real matches out of the candidate set. No attribute selection could have recovered them,
+since Step 1.5 does not re-block --- the repair had to happen before embedding.
+
+\section{Discussion}
+
+\textbf{Pair-adaptive selection outperforms both no selection and a labelled global
+baseline --- on DBLP--ACM.} There it improves F1 from 0.8706 to 0.9397 while showing the
+matcher 65\% fewer attributes ($p = 5.2\times10^{-50}$), and beats a baseline trained on 400
+labelled pairs over the identical candidate set ($p = 1.0\times10^{-12}$) while using none.
+The qualifier is not decorative: on Amazon--Walmart the same configuration only draws with
+no selection, and draws on per-pair accuracy while still trailing on F1
+(Section~\ref{sec:amazon}). The improvement is a result about one dataset; what generalises
+is weaker and is stated separately below.
+
+\textbf{How importance is elicited decides whether adaptation helps at all.} The ordinal
+formulation, on the same pipeline and rule, is significantly worse than no selection.
+Scoring each attribute in isolation produces a nearly flat importance vector that no rule
+can act on; asking for a sufficient subset forces the comparison the task requires. This is
+the most transferable finding here, and it is a property of the elicitation rather than of
+the dataset.
+
+\textbf{The rule consuming the importance vector is as consequential as the vector.} The
+same profiling output, read by the default rule, loses to the global baseline; read by
+\texttt{gap}, it beats it. Any claim about pair-adaptive selection that does not state its
+selection rule is under-specified. The default was not merely suboptimal but, on wide
+schemas, structurally incapable of condensing at all.
+
+\textbf{The benefit is conditional on the schema, and the condition is now measured.} On
+Fodors--Zagat, saturated, no method differs from any other. On DBLP--ACM, four attributes
+with \texttt{title} close to a unique key, adaptation wins. On Amazon--Walmart, twelve
+attributes with no such key, it draws: condensing to 1.34 attributes holds precision exactly
+and costs recall. The pattern across the three is that aggressive condensation wins outright
+where one or two attributes can carry the decision, and degrades to a cost-saving with no
+accuracy gain where the evidence is spread across many. Nothing in the method currently
+detects which regime it is in --- though the importance vector it already computes contains
+the information, since the regimes differ precisely in how concentrated that vector is.
+
+\textbf{The matcher is a larger source of variation than most of the effects studied here.}
+Repeating one configuration three times moves DBLP--ACM F1 by 0.03 for adaptive selection and
+0.06 for no selection, and two weeks of provider drift moved the no-selection level by 0.15
+with nothing in the pipeline changed. Several differences reported on Amazon--Walmart are
+smaller than that. The comparisons remain sound, because each is paired within a single draw,
+but the levels are properties of a matcher on a date. A useful side effect is that
+condensation roughly halves this variance (Section~\ref{sec:draws}), which is an argument for
+it that has nothing to do with accuracy.
+
+\textbf{Adaptivity earns its keep most clearly where it wins least.} On the schema where
+condensation does not improve F1, every fixed rule tried in its place is significantly
+\emph{worse} than letting the model choose per pair: a floor of two attributes
+($p = 3.5\times10^{-27}$), and a cumulative target reaching a comparable width by an
+unrelated mechanism ($p = 1.3\times10^{-19}$). The selector's most aggressive decisions ---
+the 60{,}894 pairs it cut to a single attribute --- are the ones a fixed rule most wants to
+overrule, and overruling them costs 494 false positives to buy 47 true ones. This is the
+sharpest evidence in the report that per-pair selection is doing something a global subset
+cannot, and it comes from the dataset where the method does not win.
+
+\section{Limitations}
+
+\textbf{The supervised global baseline is missing on Amazon--Walmart.} Its fixed cut-off
+selected nothing on a 12-attribute schema and the run aborted, so no \emph{labelled} global
+method is compared there. The unlabelled global comparison it was meant to supply has since
+been made another way: the fixed-floor and cumulative configurations of
+Section~\ref{sec:amazon} apply a near-constant subset width to every pair, and both are
+significantly worse than per-pair selection. What remains untested on this schema is whether
+a global subset chosen \emph{with labels} would do better than either.
+
+\textbf{The selection rule was chosen on DBLP--ACM; its confirmation is outstanding.} The
+sweep in Section~\ref{sec:rule} was read on the same pairs it reports over, so the
+cumulative targets in it are tuned values and none should be quoted as the method's
+performance. The rule adopted, \texttt{gap}, has no threshold and so contributes no tuned
+quantity, but preferring it over \texttt{cumulative} was itself a choice made after seeing
+those results.
+
+The design handles this by role separation: DBLP--ACM is the \emph{selection} dataset and
+Amazon--Walmart the \emph{held-out} one. \texttt{gap} was fixed before any Amazon--Walmart
+selection run started and has not been revised since, so the rule itself contributes no
+quantity tuned on held-out data.
+
+\textbf{That separation has since been broken once, and the Amazon--Walmart figures should
+be read accordingly.} The evidence mask of Section~\ref{sec:mask} was found by inspecting
+Amazon--Walmart failures, and it raises decisive selection there from 0.5959 to 0.6142. The
+current Amazon--Walmart numbers are therefore no longer a clean out-of-sample estimate:
+one component of the method was derived from the test set. Two considerations limit the
+damage without removing it. The mask is a correctness fix with an argument independent of
+any measurement --- an attribute blank on both sides cannot inform a decision, whatever the
+data says --- rather than a parameter fitted to improve a score. And it is inert on the
+selection dataset, changing 5 of 13{,}080 pairs and leaving DBLP--ACM F1 unchanged, so it
+cannot have been tuned to a result there either. Restoring the guarantee needs a third
+dataset that has been used for nothing else; until then the honest reading of the
+Amazon--Walmart column is a strong estimate with a known dependency on the data it is
+computed over.
+
+\textbf{Most configurations are still a single matcher draw.} Section~\ref{sec:draws}
+repeats the two DBLP--ACM headline rows three times each and finds the ordering stable and
+the levels not. Every other row in this report --- the whole of Fodors--Zagat, every
+Amazon--Walmart configuration, the rule sweep, and the four DBLP--ACM rows not repeated ---
+remains one draw, and the drift measured on DBLP--ACM gives no reason to assume the others
+are steadier. The Amazon--Walmart comparisons are the ones to treat most carefully, since
+several of the differences there are smaller than the 0.06 spread the repeated DBLP--ACM
+runs exhibited. The paired design makes each comparison valid within its own draw; it does
+not make the levels reproducible. The large DBLP--ACM effects are unlikely to reverse; the
+\texttt{gap}-versus-tuned-threshold comparison, with 81 discordant pairs and $p = 0.045$,
+could.
+
+\textbf{The supervised baseline is not an equal competitor.} It consumes 400 labelled pairs
+while the adaptive method consumes none, so the comparison measures method and label budget
+together. Its selected subset also moves with the budget --- \texttt{[title, authors]} at 10
+and 50 labels, \texttt{[title]} at 200 --- so no single sample size characterises it.
+
+\textbf{The feature vector is weaker than it appears.} Of the six per-attribute features,
+\texttt{semantic\_similarity} is disabled and constant at zero and \texttt{is\_numeric} is
+constant per column on both datasets reported here; on the widest schema
+\texttt{exact\_match} fires on 0.06\% of cells. Effectively three features carry signal. The
+vector also has no notion of value rarity, the standard discriminative signal in entity
+resolution: matching on a rare title token and on a common one are represented identically.
+
+\textbf{One sampler.} All Step 1.5 runs use the \texttt{diversity} profile sampler, held
+fixed so the other variables could be read. No claim about sampler choice is made.
+
+\end{document}

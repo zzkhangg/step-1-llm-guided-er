@@ -1,8 +1,12 @@
+import hashlib
 import json
+import os
+from pathlib import Path
+
 import pandas as pd
 from collections import defaultdict
 
-from ..llm_client import create_chat_completion_text
+from ..llm_client import PROFILE_MAX_TOKENS, create_chat_completion_text, get_llm_model
 
 ATTRIBUTE_PROMPT = (
     "You are an expert in data integration and entity resolution.\n"
@@ -50,6 +54,47 @@ ADAPTIVE_PROFILE_PROMPT = (
     "  }\n"
     "}"
 )
+
+
+# Same framing and same guardrails as ADAPTIVE_PROFILE_PROMPT above -- only the answer
+# format differs, so a run-to-run comparison isolates the response format rather than
+# confounding it with a reworded task. The ordinal variant asks for a calibrated score
+# per attribute, which the logs show the LLM does not supply: across every recorded run
+# DBLP-ACM used score 0 on 1% of judgements (a 4-point scale collapsed to 3) and
+# Fodors-Zagat used score 3 on 55%. This variant asks instead for the decision the
+# pipeline actually needs -- a subset -- and lets the model weigh attributes against
+# each other in one judgement, which is where redundancy between attributes (an address
+# adding nothing once a phone number agrees) becomes visible.
+DECISIVE_PROFILE_PROMPT = (
+    "You are an expert in entity resolution.\n\n"
+    "Your task is to analyze a pair of records and identify which attributes are decisive "
+    "for deciding whether the two records refer to the same real-world entity.\n\n"
+    "Important:\n"
+    "- Return the smallest subset of attributes that is sufficient to make the decision.\n"
+    "- Weigh the attributes against each other: omit an attribute that adds nothing once "
+    "the attributes you already selected are known.\n"
+    "- Do not select an attribute just because the values are identical if both values are "
+    "empty, missing, generic, or uninformative.\n"
+    "- An attribute can be decisive because it supports a match or because it provides strong "
+    "evidence for a non-match.\n"
+    "- Select at least one attribute, and only names from the attribute list below.\n"
+    "- Return JSON only.\n\n"
+    "Attributes:\n"
+    "{attributes}\n\n"
+    "Record A:\n"
+    "{record_a_json}\n\n"
+    "Record B:\n"
+    "{record_b_json}\n\n"
+    "Return JSON in this exact format:\n"
+    "{\n"
+    "  \"decisive_attributes\": [\"attribute_name_1\", \"attribute_name_2\"]\n"
+    "}"
+)
+
+# How profiling asks the LLM for per-attribute importance. "ordinal" is the original
+# 0-3 score; "decisive" asks for the subset directly.
+PROFILE_SCORING_MODES = ("ordinal", "decisive")
+DEFAULT_PROFILE_SCORING = "ordinal"
 
 
 def _clean_record_for_prompt(record):
@@ -126,6 +171,132 @@ def parse_adaptive_attribute_importance(content: str, attributes: list) -> dict:
     return scores
 
 
+def parse_decisive_attribute_set(content: str, attributes: list) -> dict:
+    """Parse a decisive-subset response into 1.0/0.0 scores keyed by attribute.
+
+    Returned in the same shape as parse_adaptive_attribute_importance so both scoring
+    modes feed the selector identically; only the value range differs. A response that
+    names nothing valid yields all zeros, which normalizes to a uniform vector -- the
+    same neutral fallback an unparseable ordinal response produces.
+    """
+    content = _strip_json_fences(content)
+    try:
+        payload = _load_json_with_common_repairs(content)
+    except json.JSONDecodeError:
+        print(f"  Warning: could not parse decisive LLM response: {content}")
+        return {attr: 0.0 for attr in attributes}
+
+    if isinstance(payload, dict):
+        chosen = payload.get("decisive_attributes", [])
+    else:
+        # A bare list is a plausible deviation from the requested envelope.
+        chosen = payload
+
+    if not isinstance(chosen, list):
+        print(f"  Warning: decisive response was not a list: {content}")
+        return {attr: 0.0 for attr in attributes}
+
+    valid = set(attributes)
+    selected = {str(item).strip() for item in chosen}
+    unknown = selected - valid
+    if unknown:
+        print(f"  Warning: decisive response named unknown attributes {sorted(unknown)}")
+    return {attr: (1.0 if attr in selected else 0.0) for attr in attributes}
+
+
+# ── 0. Profiling response cache ──
+#
+# Step-1.5 trains its whole selector on one small sample -- 20 pairs on Fodors-Zagat --
+# so the profiling responses have far more leverage over the run than any single matcher
+# answer does. They are also not stable: re-running the identical prompts at
+# temperature=0 changed 8 of 20 pairs' scores and 13% of individual cells, because
+# OpenRouter serves each call from a different upstream host. That makes an A/B over
+# selection policy unreadable, since the two runs differ in the policy *and* in what the
+# selector was trained on. Caching by prompt holds the profiling fixed so a policy
+# comparison varies only the policy.
+#
+# It does not suppress the variation being studied elsewhere: a different seed samples
+# different profile pairs, and a different scoring mode builds a different prompt, so
+# both still miss the cache and issue fresh calls.
+
+PROFILE_CACHE_DIR = Path(os.getenv("PROFILE_CACHE_DIR", "cache/default/profiling"))
+USE_PROFILE_CACHE = os.getenv("PROFILE_DISABLE_CACHE", "").lower() not in {"1", "true", "yes"}
+
+
+def set_profile_cache_dir(cache_dir):
+    """Set the directory holding cached Step-1.5 profiling responses."""
+    global PROFILE_CACHE_DIR
+    PROFILE_CACHE_DIR = Path(cache_dir)
+    PROFILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def set_profile_cache_enabled(enabled):
+    """Enable or disable profiling cache reads and writes."""
+    global USE_PROFILE_CACHE
+    USE_PROFILE_CACHE = bool(enabled)
+
+
+def profile_cache_key(prompt, model, scoring):
+    """Hash everything that determines the response: model, scoring mode, exact prompt."""
+    payload = json.dumps({"model": model, "scoring": scoring, "prompt": prompt}, sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _load_profile_cache(key):
+    if not USE_PROFILE_CACHE:
+        return None
+    cache_file = PROFILE_CACHE_DIR / f"{key}.json"
+    if not cache_file.exists():
+        return None
+    try:
+        with open(cache_file, "r") as handle:
+            return json.load(handle)
+    except (json.JSONDecodeError, OSError):
+        # A half-written cache entry must not take down a run; re-query instead.
+        return None
+
+
+def _save_profile_cache(key, data):
+    if not USE_PROFILE_CACHE:
+        return
+    PROFILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(PROFILE_CACHE_DIR / f"{key}.json", "w") as handle:
+        json.dump(data, handle, indent=2)
+
+
+def profiling_completion(prompt, scoring):
+    """Return (content, usage) for a profiling prompt, reusing a cached response if present.
+
+    usage carries cache_hit so callers can report how much of a run was replayed. Token
+    counts on a hit are the ones the original call reported, matching how the matcher
+    cache accounts for reuse.
+    """
+    model = get_llm_model()
+    key = profile_cache_key(prompt, model, scoring)
+
+    cached = _load_profile_cache(key)
+    if cached is not None:
+        usage = dict(cached.get("usage", {}))
+        usage["cache_hit"] = True
+        return cached.get("content", ""), usage
+
+    content, usage = create_chat_completion_text(
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        max_tokens=PROFILE_MAX_TOKENS,
+    )
+    _save_profile_cache(key, {
+        "model": model,
+        "scoring": scoring,
+        "prompt": prompt,
+        "content": content,
+        "usage": usage,
+    })
+    usage = dict(usage)
+    usage["cache_hit"] = False
+    return content, usage
+
+
 # ── 1. Query LLM for field importance per pair ──
 
 def query_llm_field_importance(idx_a, idx_b, label, df_A, df_B):
@@ -162,6 +333,7 @@ def query_llm_field_importance_with_usage(idx_a, idx_b, label, df_A, df_B):
     content, usage_dict = create_chat_completion_text(
         messages=[{"role": "user", "content": prompt}],
         temperature=0,
+        max_tokens=PROFILE_MAX_TOKENS,
     )
     return parse_important_attribute_list(content, attributes), usage_dict
 
@@ -189,11 +361,37 @@ def query_llm_adaptive_attribute_importance_with_usage(idx_a, idx_b, df_A, df_B)
               .replace("{record_a_json}", json.dumps(recA, ensure_ascii=False))
               .replace("{record_b_json}", json.dumps(recB, ensure_ascii=False)))
 
-    content, usage_dict = create_chat_completion_text(
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-    )
+    content, usage_dict = profiling_completion(prompt, "ordinal")
     return parse_adaptive_attribute_importance(content, attributes), usage_dict
+
+
+def query_llm_decisive_attributes_with_usage(idx_a, idx_b, df_A, df_B):
+    """
+    Ask LLM for the decisive attribute subset for one pair.
+    Returns (scores, usage_dict) with 1.0 for selected attributes and 0.0 otherwise.
+    """
+    attributes = [c for c in df_A.columns if c in df_B.columns]
+    recA = _clean_record_for_prompt(df_A.iloc[idx_a].to_dict())
+    recB = _clean_record_for_prompt(df_B.iloc[idx_b].to_dict())
+
+    prompt = (DECISIVE_PROFILE_PROMPT
+              .replace("{attributes}", json.dumps(attributes, ensure_ascii=False))
+              .replace("{record_a_json}", json.dumps(recA, ensure_ascii=False))
+              .replace("{record_b_json}", json.dumps(recB, ensure_ascii=False)))
+
+    content, usage_dict = profiling_completion(prompt, "decisive")
+    return parse_decisive_attribute_set(content, attributes), usage_dict
+
+
+def query_llm_profile_importance_with_usage(idx_a, idx_b, df_A, df_B, scoring=DEFAULT_PROFILE_SCORING):
+    """Dispatch adaptive profiling to the configured scoring mode."""
+    if scoring == "ordinal":
+        return query_llm_adaptive_attribute_importance_with_usage(idx_a, idx_b, df_A, df_B)
+    if scoring == "decisive":
+        return query_llm_decisive_attributes_with_usage(idx_a, idx_b, df_A, df_B)
+    raise ValueError(
+        f"Unknown profile scoring mode {scoring!r}; expected one of {PROFILE_SCORING_MODES}"
+    )
 
 
 # ── 2. Aggregate importance scores across all sampled pairs ──

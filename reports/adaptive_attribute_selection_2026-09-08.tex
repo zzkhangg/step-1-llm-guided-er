@@ -1,0 +1,238 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{amsmath}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+\setlength{\emergencystretch}{2em}
+
+\title{DBLP--Scholar Evaluation: Results and Protocol Deviations}
+\author{}
+\date{2026-09-08}
+
+\begin{document}
+\maketitle
+
+With the method configuration frozen before evaluation on DBLP--Scholar,
+pair-adaptive selection achieved higher end-to-end F1 than showing all attributes
+in both observed execution windows. In the two repetitions per arm on 7 September,
+mean F1 was 0.5963 versus 0.5534, with an 18.47\% reduction in pipeline tokens.
+The gain came from fewer false positives, accompanied by lower recall.
+Blocking recovered only 47.50\% of the gold matches, which limits the entire pipeline.
+
+The planned three-draw same-day experiment was not completed as registered.
+One draw per arm completed on 4 September; two per arm completed on 7 September
+after changes to recovery and retry handling. The windows are reported separately.
+This report supplements the submitted Week 6 report and does not replace its results.
+
+\section{Protocol and Configuration}
+DBLP--Scholar contains 2,616 Table-A records, 64,263 Table-B records, 5,347
+gold matches and four attributes: title, authors, venue and year. Method settings
+were copied from DBLP--ACM before the first evaluation, as recorded in
+\path{docs/heldout_preregistration_2026-09-04.md}. The adaptive arm profiles
+candidate pairs without using gold labels, fits a transfer model and selects a
+subset for each pair. The full arm shows all four attributes. Both arms receive
+the same candidate set and use the same matcher prompt template.
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{p{0.24\textwidth}p{0.68\textwidth}}
+\toprule
+Stage & Frozen settings \\
+\midrule
+Embedding & \texttt{BAAI/bge-large-en-v1.5}; per-column encoding, concatenation and normalisation \\
+Blocking & 15 LSH tables, 8 planes, one-bit probing, top-$k=5$ per Table-A record \\
+Profiling & 50 pairs; \texttt{diversity} sampler; \texttt{decisive} elicitation; 4 workers \\
+Transfer & Ridge ($\alpha=1$), cosine 5-neighbour retrieval, weighted average 0.5/0.5 \\
+Selection & \texttt{gap}; minimum 1, maximum 5 (schema width 4); required role \texttt{identity}; mask \texttt{drop}; canonical field order \\
+Matcher & \texttt{deepseek/deepseek-v4-flash-0731}; temperature 0; reasoning disabled; output cap 256; 16 workers; unpinned provider routing \\
+Seeds & Pipeline 42; blocking 42 \\
+\bottomrule
+\end{tabular}
+\caption{Settings used for the completed Scholar comparison. The current blocking
+implementation always probes one-bit neighbours, matching the frozen
+\texttt{num\_flips=1}; other values of that argument are not implemented.}
+\end{table}
+
+\textbf{Operational deviations.} Attempts on 5 September did not produce valid
+results: each draw-2 attempt ended with one empty matcher response, and adaptive
+draw 3 stopped during blocking. On 7 September, a separate pair-indexed checkpoint
+was added to each remaining draw while response caching remained disabled.
+The empty-response limit increased from three to six attempts. Failed-attempt
+token usage is now retained. The method settings above were unchanged.
+The dated deviations log classifies these as exploratory repetitions under an
+amended operational protocol, with frozen method settings.
+
+The four new runs completed between 15:17 and 17:32 Brisbane time on 7 September,
+in the order adaptive 2, full 2, adaptive 3, full 3. None required a restart.
+All 52,320 new pair answers were saved, with zero cache or checkpoint hits during
+execution. One empty response in full draw 3, served by DeepInfra with
+\texttt{finish\_reason=stop}, succeeded on retry; its 275 reported tokens are included
+in that run's cost. There were 52,321 application-level completion attempts.
+SDK-internal retries do not expose complete usage accounting.
+
+\textbf{Validation.} Recalculation from the six CSVs agrees with their run summaries.
+All six contain the same 13,080 distinct candidate pairs, no terminal matcher errors
+and no response-cache hits. All adaptive profiling error counts are zero. The 52,320
+new checkpoint records agree with their CSV answers, attributes, provider, request
+hash, raw response and aggregate matching tokens. The regression suite has 153
+passing tests, including interrupted-run recovery with mocked calls.
+
+\section{Results by Execution Window}
+Candidate recall uses the 2,540 gold matches present in the candidate set as its
+denominator. End-to-end recall uses all 5,347 gold matches. Precision is identical
+at both levels because the pipeline predicts positives only among candidates.
+F1 is computed separately at each level. Thus a high candidate F1 does not imply
+high recall over the full benchmark.
+
+\begin{table}[H]
+\centering\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrrrr}
+\toprule
+Arm / draw & P & Cand. R & Cand. F1 & E2E R & E2E F1 & Tokens \\
+\midrule
+Adaptive / 1 & 0.9518 & 0.9559 & 0.9538 & 0.4541 & 0.6148 & 3,045,919 \\
+Full / 1     & 0.8896 & 0.9744 & 0.9301 & 0.4629 & 0.6089 & 3,748,500 \\
+\bottomrule
+\end{tabular}
+\caption{4 September: one draw per arm under the original operational protocol.
+The end-to-end F1 difference is +0.0059, with 18.74\% fewer pipeline tokens.}
+\end{table}
+
+\begin{table}[H]
+\centering\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrrrr}
+\toprule
+Arm / draw & P & Cand. R & Cand. F1 & E2E R & E2E F1 & Tokens \\
+\midrule
+Adaptive / 2 & 0.8754 & 0.9516 & 0.9119 & 0.4520 & 0.5962 & 3,031,488 \\
+Full / 2     & 0.7094 & 0.9728 & 0.8205 & 0.4621 & 0.5597 & 3,717,979 \\
+Adaptive / 3 & 0.8690 & 0.9559 & 0.9104 & 0.4541 & 0.5965 & 3,031,597 \\
+Full / 3     & 0.6834 & 0.9602 & 0.7985 & 0.4561 & 0.5471 & 3,718,319 \\
+\midrule
+Adaptive mean & 0.8722 & 0.9537 & 0.9111 & 0.4531 & 0.5963 & 3,031,542.5 \\
+Full mean     & 0.6964 & 0.9665 & 0.8095 & 0.4591 & 0.5534 & 3,718,149 \\
+\bottomrule
+\end{tabular}
+\caption{7 September: two draws per arm under amended recovery behaviour.
+Means are arithmetic means of the two run-level values, not pooled-pair metrics.}
+\end{table}
+
+For 7 September, the end-to-end F1 ranges are [0.5962, 0.5965] for adaptive and
+[0.5471, 0.5597] for full. The mean difference is +0.0430; the candidate-level
+difference is +0.1016. Pipeline tokens fall by 18.47\%. These are two-draw
+observations and are not substituted for the registered three-draw same-day test.
+No across-date mean is used as the primary comparison.
+
+Pipeline token totals include the fixed profiling workload (15,208 tokens per
+adaptive run), even when profiling is replayed from cache. They describe the
+logical pipeline workload, rather than an account invoice for each invocation.
+The 7 September figures also include reported failed-attempt usage; the older
+logging did not retain that overhead.
+
+\section{What Produces the Gain}
+\begin{table}[H]
+\centering\small
+\begin{tabular}{lrrrr}
+\toprule
+Draw & Adaptive TP & Full TP & Adaptive FP & Full FP \\
+\midrule
+2 & 2,417 & 2,471 & 344 & 1,012 \\
+3 & 2,428 & 2,439 & 366 & 1,130 \\
+\bottomrule
+\end{tabular}
+\caption{Errors on the same candidate sets on 7 September.}
+\end{table}
+
+In draw 2, condensation removes 668 false positives while losing 54 true positives.
+In draw 3, it removes 764 false positives while losing 11 true positives. The
+precision improvement outweighs the recall reduction in the observed F1 scores.
+This supports an observed reduction in false positive matching; the experiment
+does not identify the model's internal reasoning process.
+
+The selector shows an average of 1.3446 attributes per pair, compared with four
+for full. Title appears on all 13,080 pairs, authors on 3,065, year on 1,442 and
+venue on none. The two new adaptive runs reuse all 50 profiling responses, and
+their selected subsets are identical to draw 1. These repetitions therefore
+measure matcher variability conditional on one fixed profile sample and selector;
+they do not estimate variability from resampling or re-profiling.
+
+\textbf{Blocking limits coverage.} The common candidate set contains 2,540 of
+5,347 gold matches. The remaining 2,807 never reach either matcher arm. Even a
+perfect matcher on these candidates could attain only 47.50\% end-to-end recall.
+The completed comparison must retain this result. Tuning blocking on Scholar
+would be a separate exploratory study, not a revision of this frozen evaluation.
+
+\section{Stability and Prediction Audit}
+Between draws 2 and 3, adaptive changes its answer on 565/13,080 pairs (4.32\%),
+whereas full changes on 1,754/13,080 (13.41\%). Adaptive is more stable in this
+observed pair of repeats. Two runs per arm do not establish a general variance
+reduction claim. Provider mixtures also differ between runs; for example,
+OpenInference accounts for 26.2\% of full draw 2 and 34.7\% of full draw 3.
+Same-day execution reduces the date confound but does not fix the serving mixture
+or isolate routing from within-provider sampling. The much different F1 levels
+on 4 and 7 September must not be attributed to a change in attribute selection.
+
+\begin{description}
+\item[P1: higher F1 and disjoint three-draw ranges.]
+The positive direction is supported within both observed windows. The registered
+three-draw same-day test was not completed as specified, so P1 is not marked as
+fully confirmed. The amended two-draw ranges on 7 September are disjoint.
+\item[P2: F1 gain between +0.05 and +0.15.]
+The 7 September end-to-end gain is +0.0430, a partial miss. End-to-end F1 is used
+here consistently with the DBLP--ACM +0.186 comparison motivating this prediction;
+the larger candidate-level gain is not substituted after seeing the outcome.
+\item[P3: 15--35\% token reduction.]
+The observed 18.47\% reduction on 7 September falls within the interval.
+\item[P4: 1.2--2.5 attributes per pair.]
+The observed mean of 1.3446 falls within the interval.
+\item[P5: title most frequent and present on over half the pairs.]
+Numerically satisfied, but required-role enforcement forces the only identity
+attribute, title, into the selection. This is not independent evidence that
+the learned importance model discovers title's value.
+\item[P6: more mask activity than on DBLP--ACM.]
+An offline reconstruction of the frozen selector reproduces every observed
+subset and finds 120 pairs whose selected subset changes when the mask is applied,
+compared with the previously reported five on DBLP--ACM. There are 1,453 candidate
+pairs with at least one blank, which is a different quantity. The anticipated
+year/venue explanation is not established by this count alone. No optional
+Scholar mask-ablation matcher runs were performed.
+\end{description}
+
+The supported thesis statement is that the frozen adaptive configuration improves
+F1 and reduces token workload in the observed Scholar comparisons, mainly through
+fewer false positives, at a recall cost. Report this together with the low blocking
+coverage, limited repetitions and unresolved service variation. Claims of universal
+improvement, provider causation or complete confirmation of the original protocol
+are not supported by these results.
+
+\section{Reproducibility and Next Work}
+The submitted Week 6 files remain unchanged. The current handoff is
+\path{docs/HANDOFF_step15.md}; the dated protocol deviations are appended to the
+pre-registration. The offline validator is
+\path{examples/analyze_heldout_runs.py}, with output at
+\path{logs/heldout/validated_results.json}. It checks result completeness, errors,
+candidate-set equality and agreement between CSV-derived metrics and summaries.
+The mask counts and answer-flip counts above were checked separately by offline
+selector replay and pair-indexed CSV comparison on 8 September.
+
+Run summaries and CSVs are under \path{logs/DBLP-Scholar/runs/}, in these directories:
+\begin{itemize}\small
+\item \path{20260904_143805_step15_diversity_decisive_gap_mink1}
+\item \path{20260904_151442_full}
+\item \path{20260907_155012_step15_diversity_decisive_gap_mink1}
+\item \path{20260907_162452_full}
+\item \path{20260907_165612_step15_diversity_decisive_gap_mink1}
+\item \path{20260907_173241_full}
+\end{itemize}
+
+The next planned experiment is the sampler comparison on development datasets,
+after explicitly aligning its commands with the headline decisive/gap/minimum-one
+configuration. Provider-conditioned work remains a separate open question.
+Neither that sweep nor any blocking tuning was run for this report. Cascade work
+remains parked under the supervisor's instruction.
+
+\end{document}

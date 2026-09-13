@@ -11,28 +11,30 @@ from ..lsh import query_lsh_fast
 
 # ── 1. Field-level similarity features ──
 
+# A value missing from both records carries no evidence either way, so all three features
+# score it 0.0 rather than treating "both blank" as agreement. Ranking attributes by
+# classifier weight is otherwise biased towards sparsely populated columns, whose blanks
+# co-occur with the label far more often than their values do.
 def token_overlap(a: str, b: str) -> float:
     """Jaccard similarity between token sets."""
-    if not a or not b:
-        return 0.0
     set_a = set(str(a).lower().split())
     set_b = set(str(b).lower().split())
-    if not set_a and not set_b:
-        return 1.0
+    if not set_a or not set_b:
+        return 0.0
     return len(set_a & set_b) / len(set_a | set_b)
 
 
 def edit_similarity(a: str, b: str) -> float:
     """Normalized edit distance similarity."""
-    if not a and not b:
-        return 1.0
     if not a or not b:
         return 0.0
     return SequenceMatcher(None, str(a).lower(), str(b).lower()).ratio()
 
 
 def exact_match(a: str, b: str) -> float:
-    """1 if values are identical, 0 otherwise."""
+    """1 if values are identical and present, 0 otherwise."""
+    if not str(a).strip() or not str(b).strip():
+        return 0.0
     return float(str(a).lower().strip() == str(b).lower().strip())
 
 
@@ -150,21 +152,54 @@ def train_attribute_selector(df_A, df_B, labeled_pairs, cols):
 
 # ── 4. Select top attributes based on importance ──
 
-def select_top_attributes(ranked, threshold=0.1, top_k=None):
+# The importance scores are normalised to sum to one, so an attribute's mean share is
+# 1/m and a fixed cut-off is not scale-free: the wider the schema, the smaller every
+# share, until no attribute clears the bar and the strategy selects nothing. That is not
+# hypothetical -- on Amazon-Walmart's 12 attributes the mean share is 0.083 against the
+# 0.3 default, the selection came back empty, and the run aborted.
+#
+# The bar is therefore expressed as a multiple of the uniform share. The multiple is 1.2
+# because that reproduces the previous behaviour exactly on a four-attribute schema
+# (1.2/4 = 0.3, the old default), so the DBLP-ACM results this value was never chosen
+# against are unchanged. It was not picked to make any particular dataset work.
+UNIFORM_SHARE_MULTIPLE = 1.2
+
+
+def select_top_attributes(ranked, threshold=None, top_k=None,
+                          uniform_share_multiple=UNIFORM_SHARE_MULTIPLE):
     """
-    Keep attributes whose importance score exceeds threshold.
-    
+    Keep attributes carrying at least ``uniform_share_multiple`` times the uniform share.
+
     Parameters
     ----------
-    ranked    : list of (attr, score) from train_attribute_selector
-    threshold : minimum importance score to keep attribute
+    ranked    : list of (attr, score) from train_attribute_selector, scores summing to 1
+    threshold : absolute cut-off, retained for callers that need the old behaviour;
+                when given it overrides the relative bar
     top_k     : maximum number of ranked attributes to retain
+    uniform_share_multiple : bar as a multiple of 1/len(ranked)
     """
-    selected = [attr for attr, score in ranked if score >= threshold]
+    if not ranked:
+        return []
+
+    if threshold is not None:
+        bar = float(threshold)
+        bar_text = f"score >= {bar:g}"
+    else:
+        bar = float(uniform_share_multiple) / len(ranked)
+        bar_text = f"score >= {uniform_share_multiple:g}/{len(ranked)} = {bar:.4f}"
+
+    selected = [attr for attr, score in ranked if score >= bar]
+    if not selected:
+        # Every attribute can sit below the bar when importance is near-uniform, which
+        # says the attributes are indistinguishable, not that none of them is usable.
+        # Falling back to the top-ranked one keeps the run alive and is still a
+        # defensible global subset; returning nothing is not.
+        selected = [ranked[0][0]]
+        print(f"\nNo attribute cleared {bar_text}; falling back to the top-ranked one.")
     if top_k is not None:
         selected = selected[: int(top_k)]
     top_k_text = "all" if top_k is None else str(top_k)
-    print(f"\nSelected attributes (score >= {threshold}, top_k={top_k_text}): {selected}")
+    print(f"\nSelected attributes ({bar_text}, top_k={top_k_text}): {selected}")
     return selected
 
 
@@ -181,7 +216,7 @@ def supervised_selection(
     planes_list,
     blocking_top_k=5,
     neg_ratio=1.0,     # negatives : positives
-    threshold=0.1,
+    threshold=None,
     save_model=False,
     model_path="attr_selector_clf.pkl",
     scaler_path="attr_selector_scaler.pkl"

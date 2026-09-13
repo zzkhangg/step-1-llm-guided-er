@@ -3,8 +3,13 @@ from .manual import manual_selection
 from .supervised import supervised_selection
 from .llm_guided import llm_guided_selection
 from .adaptive import (
+    DEFAULT_RATIO_LAMBDA,
+    DEFAULT_SELECTION_POLICY,
+    SELECTION_POLICIES,
     AttributeImportancePredictor,
     FEATURE_ORDER,
+    attribute_evidence_mask,
+    attribute_blankness,
     HybridAttributeSelector,
     ProfileRetriever,
     compute_importance_proxy_scores,

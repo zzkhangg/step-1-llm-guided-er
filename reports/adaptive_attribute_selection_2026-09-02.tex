@@ -1,0 +1,356 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{amsmath}
+\usepackage{graphicx}
+
+\setlength{\emergencystretch}{2em}
+
+\title{Weekly Report: Week 6}
+\author{}
+\date{2026-09-02}
+
+\begin{document}
+\maketitle
+
+This report covers only what is new since Week 5. The pipeline, the elicitation and
+selection-rule comparisons, the Fodors--Zagat and DBLP--ACM result tables, and the
+three-draw DBLP--ACM repeat are as reported there and are not restated.
+
+Nine runs were executed for this report, totalling 344{,}888 matcher calls with
+\textbf{zero API errors}. All use the matcher \texttt{deepseek-\allowbreak v4-\allowbreak
+flash-\allowbreak 0731} and the embedding model \texttt{bge-\allowbreak large-\allowbreak
+en-\allowbreak v1.5}.
+
+\section{Hyperparameters}
+\label{sec:hyper}
+
+Requested for this report, and previously only recoverable from the run summaries. Everything
+below is held fixed across every run in Weeks 5 and 6 unless a result explicitly varies it.
+
+\begin{table}[H]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lll}
+\toprule
+Stage & Parameter & Value \\
+\midrule
+Embedding   & model                       & \texttt{BAAI/bge-large-en-v1.5} \\
+            & encoding                    & per column, concatenated, L2-normalised \\
+\midrule
+Blocking    & scheme                      & multi-probe LSH, random hyperplanes \\
+            & tables / planes / flips     & 15 / 8 / 1 (DBLP--ACM), 10 / 4 / 1 (Amazon--Walmart) \\
+            & top-$k$ per Table-A record  & 5 (DBLP--ACM), 4 (Amazon--Walmart) \\
+\midrule
+Profiling   & sampler                     & \texttt{diversity} \\
+            & sample size                 & 50 candidate pairs \\
+            & elicitation                 & \texttt{decisive} (\texttt{ordinal} where stated) \\
+            & concurrency                 & 4 workers \\
+\midrule
+Transfer    & predictor                   & Ridge regression over 6 features per attribute \\
+            & retriever                   & cosine $k$-NN, $k = 5$ \\
+            & fusion                      & \texttt{weighted\_average}, 0.5 / 0.5 \\
+\midrule
+Selection   & rule                        & \texttt{gap} (no threshold) \\
+            & $k$ bounds                  & $\min = 1$, $\max = 5$ \\
+            & cumulative target           & 0.8 (only for the \texttt{cumulative} rule) \\
+            & ratio $\lambda$             & 1.5 (only for the \texttt{ratio} rule) \\
+            & required roles              & \texttt{identity} \\
+            & blank-field handling        & \texttt{drop} (Section~\ref{sec:mask}) \\
+            & attribute order in prompt   & canonical (table-column order) \\
+\midrule
+Matcher     & model                       & \texttt{deepseek/deepseek-v4-flash-0731} \\
+            & temperature                 & 0 \\
+            & max tokens                  & 256 \\
+            & reasoning                   & disabled \\
+            & concurrency                 & 8 workers \\
+\midrule
+Seeds       & pipeline / blocking         & 42 / 42 \\
+            & candidate slice (repeats)   & 20{,}000 pairs, seed 7 \\
+\bottomrule
+\end{tabular}}
+\caption{Hyperparameters. Attribute \emph{roles} are assigned per dataset from the column
+name: \texttt{title} and \texttt{modelno} are \texttt{identity}, \texttt{authors} and
+\texttt{brand} \texttt{strong\_support}, \texttt{venue}, \texttt{year} and \texttt{category}
+\texttt{context}, and the remaining Amazon--Walmart columns \texttt{other}. Only
+\texttt{identity} is required, which is what forces at least one identifying field into every
+selection.}
+\end{table}
+
+\section{The Matcher Drifts, and the Drift Is Now Measured Directly}
+\label{sec:drift}
+
+Week 5 inferred provider drift from the fact that F1 levels moved while the pipeline did not.
+It can be measured without that inference. The August and late-August response caches share
+\textbf{69{,}087 Amazon--Walmart prompts that are identical byte for byte}. Replaying the
+same prompt to the same model slug on the two dates:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lr}
+\toprule
+Identical prompts compared        & 69{,}087 \\
+Answered Yes in August            & 1{,}589 \\
+Answered Yes in late August       & 3{,}250 \\
+Moved No $\rightarrow$ Yes        & 2{,}269 \\
+Moved Yes $\rightarrow$ No        & 608 \\
+Disagreement rate                 & 4.16\% \\
+\bottomrule
+\end{tabular}
+\caption{The same input, the same model slug, two dates. The imbalance is 3.7 to 1 toward
+Yes, so this is a directional shift and not sampling noise.}
+\end{table}
+
+The consequence is visible in one configuration held constant across three dates
+(Step 1.5, decisive, \texttt{gap}, $k \ge 1$, all 88{,}296 Amazon--Walmart pairs):
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+Date & Precision & Recall & F1 \\
+\midrule
+19 August & 0.4762 & 0.7962 & 0.5959 \\
+20 August & 0.4986 & 0.7997 & 0.6142 \\
+31 August & 0.2215 & 0.8093 & \textbf{0.3478} \\
+\bottomrule
+\end{tabular}
+\caption{Identical code, identical prompts, identical model slug. Precision more than halves;
+recall does not move, because a matcher answering Yes more often loses precision and keeps
+recall.}
+\end{table}
+
+\textbf{The routing behind this is now observed rather than inferred.} Until this week
+nothing in the recorded response could name the cause, so provider variation was a
+hypothesis. OpenRouter returns a non-standard \texttt{provider} field on each completion, and
+the pipeline now records it per call, into the response cache and into
+\texttt{final\_results.csv}, with a per-run histogram in the run summary. Forty calls issued
+back to back against the single slug \texttt{deepseek/deepseek-v4-flash-0731} were served by
+\textbf{eleven distinct providers}: OpenInference (22\%), DigitalOcean (18\%), Ambient and
+Relace (12\% each), DeepInfra (10\%), Inceptron (8\%), Together and StreamLake (5\% each),
+and Reka, Fireworks and Sail Research (one call each). One slug is therefore not one model in
+any operational sense, and no run of this pipeline before this week can say which mixture
+produced it.
+
+\textbf{No comparison may place its two arms on different dates.} Every run reported below
+was executed inside a single window for this reason.
+
+\textbf{Amazon--Walmart is the noisier benchmark, not the calmer one.} Its seven times larger
+pair count might be expected to average random flips away. Two runs of no selection over an
+identical fixed slice of 20{,}000 pairs, both on 27 August, disagree on 1{,}040 of them ---
+\textbf{5.20\%}, above DBLP--ACM's 4.82\% --- and on \textbf{0.078 F1}, 0.3299 against
+0.4083. Several differences reported for this dataset in Week 5 are smaller than that.
+
+\section{Repeating the Amazon--Walmart Comparison Dissolves It}
+\label{sec:amazon}
+
+The Week 5 table separates no selection from adaptive selection by 0.023 F1, against a
+run-to-run spread of 0.078. The comparison was repeated three times per arm on a fixed random
+slice of 20{,}000 candidate pairs (seed 7, containing 233 of the 1{,}143 ground-truth
+matches), all six runs inside one day, each writing its own response cache so that every draw
+is independent rather than a replay.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrrrl}
+\toprule
+Configuration & Draw 1 & Draw 2 & Draw 3 & Mean & Range \\
+\midrule
+No selection (\texttt{full})       & 0.3442 & 0.4311 & 0.3953 & 0.3902 & [0.3442, 0.4311] \\
+Step 1.5, decisive (\texttt{gap})  & 0.3204 & 0.3820 & 0.3945 & 0.3656 & [0.3204, 0.3945] \\
+\bottomrule
+\end{tabular}
+\caption{Amazon--Walmart F1 over three independent draws per arm, 31 August--1 September.
+Levels are not comparable with the Week 5 table, which scores over all 88{,}296 pairs and was
+run three weeks earlier.}
+\end{table}
+
+\textbf{The ranges overlap almost completely, and the paired tests do not agree on a sign.}
+Pairing the draws in order gives no selection uniquely correct on 755 pairs against 725
+($p = 0.45$), then 588 against 514 ($p = 0.028$), then 538 against 594 ($p = 0.10$) --- a
+tie, a win for no selection, and a lead for adaptive selection, from three repetitions of one
+experiment. The two configurations are not distinguishable on this dataset, and the 0.023 F1
+advantage reported in Week 5 is a property of which draw was taken. \textbf{That ordering is
+withdrawn.}
+
+\textbf{Two quantities do survive repetition.}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lll}
+\toprule
+ & No selection & Step 1.5, decisive \\
+\midrule
+Recall (range over 3 draws)    & [0.9313, 0.9528] & [0.8670, 0.8755] \\
+Precision (range over 3 draws) & [0.2111, 0.2785] & [0.1965, 0.2554] \\
+Pipeline tokens (mean)         & 20{,}607{,}108   & \textbf{5{,}186{,}455} \\
+\bottomrule
+\end{tabular}
+\caption{Recall separates cleanly and in the same direction every draw --- a consistent cost
+of roughly 0.074 --- while precision overlaps, so nothing is bought back. Cost separates by
+far more: a 74.8\% reduction, of which profiling consumes 55{,}448 tokens.}
+\end{table}
+
+The defensible claim on this schema is therefore narrower than Week 5 states it.
+Pair-adaptive selection removes three quarters of the token cost with no measurable change in
+F1 and a reliable loss of recall. It is a cost--quality trade, not an accuracy result, and it
+stands in deliberate contrast to DBLP--ACM, where the same configuration separates from no
+selection by 0.186 with non-overlapping ranges.
+
+\section{Blank Fields: Removing Them and Hiding Them Are Two Different Things}
+\label{sec:mask}
+
+The evidence mask of Week 5 zeroes an attribute's importance when either record leaves it
+blank, which bars it from being \emph{selected}. As implemented it also keeps the field out of
+the prompt entirely. Those are separable operations, and the distinction was raised by the
+supervisor: a matcher shown \texttt{modelno} as an empty field can read it as unknown,
+whereas one never shown the field cannot distinguish a missing value from a schema without
+that column.
+
+A second mode, \texttt{keep}, bars the attribute from selection exactly as before but appends
+it, blank, to the prompt. Selection is byte-identical under both, so the runs differ only in
+what the matcher reads. Both were run back to back on one day over all 88{,}296 pairs, sharing
+a response cache so that the 62{,}770 pairs whose prompt is unchanged replay rather than being
+re-drawn.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrrrr}
+\toprule
+Blank fields in the prompt & Precision & Recall & F1 & TP & FP \\
+\midrule
+Removed (\texttt{drop})                & 0.2215 & 0.8093 & 0.3478 & 925 & 3{,}251 \\
+Shown (\texttt{keep})                  & 0.2017 & 0.8119 & 0.3231 & 928 & 3{,}674 \\
+Shown only when blank on both sides    & \textbf{0.2251} & 0.8075 & \textbf{0.3521} & 923 & \textbf{3{,}177} \\
+\bottomrule
+\end{tabular}
+\caption{Amazon--Walmart, all three runs 31 August--1 September. Levels sit far below the
+same configuration's 0.6142 in Week 5 for the reason given in Section~\ref{sec:drift}; only
+the within-table comparison is meaningful.}
+\end{table}
+
+Showing every blank field costs 423 false positives to buy 3 true ones, and loses the paired
+test 1{,}155 uniquely correct pairs to 737 ($p = 6.2\times10^{-22}$) over the 25{,}526 pairs
+whose prompt differs. \textbf{Splitting those pairs by which kind of blank was restored shows
+that the single answer was hiding two opposite ones.}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrrrr}
+\toprule
+Restored attribute was & Pairs & Gold matches & \texttt{drop} right & \texttt{keep} right & $p$ \\
+\midrule
+blank on one side  & 12{,}894 & 242 (1.88\%) & \textbf{999} & 504 & $7.5\times10^{-38}$ \\
+blank on both      & 12{,}560 &  14 (0.11\%) & 157 & \textbf{233} & $1.1\times10^{-4}$ \\
+\bottomrule
+\end{tabular}
+\caption{The two kinds of missingness carry opposite signal.}
+\end{table}
+
+The gold labels explain the reversal without reference to the matcher. Against a base match
+rate of 1.18\% over the candidate pairs, a field blank on exactly one side is mildly
+\emph{pro}-match, while a field blank on both is strongly anti-match:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+Attribute & Both sides present & \textbf{One side blank} & Both sides blank \\
+\midrule
+\texttt{modelno}    & 1.26\% & \textbf{1.88\%} & 0.11\% \\
+\texttt{shortdescr} & 1.10\% & \textbf{1.97\%} & 0.35\% \\
+\texttt{dimensions} & 1.27\% & \textbf{2.05\%} & 0.52\% \\
+\texttt{longdescr}  & 1.17\% & \textbf{2.74\%} & 0.00\% \\
+\texttt{brand}      & 1.18\% & \textbf{1.85\%} & 0.00\% \\
+\bottomrule
+\end{tabular}
+\caption{Match rate among the 88{,}296 Amazon--Walmart candidate pairs, base rate 1.18\%. A
+sparsely catalogued record is more often a genuine second listing of the same product than a
+different product described in full, which is why a one-sided blank is not evidence against a
+match. A field neither record carries is: \texttt{modelno} at 0.11\% is nearly ten times below
+base. No LLM calls were needed to produce this table.}
+\end{table}
+
+Showing a half-filled field invites agreement it has not earned; showing that neither record
+has the field is a genuine reason to doubt. A third mode keeping only the second case wins the
+paired test against \texttt{drop}, 233 to 157 over 12{,}632 affected pairs
+($p = 1.4\times10^{-4}$), and is implemented as \texttt{-{-}evidence-mask-mode both\_blank}.
+
+\textbf{This is reported as mechanism, not as an improvement, and \texttt{drop} remains the
+default everywhere else.} The margin is 0.0043 F1 against the 0.078 spread two identical runs
+exhibit on this dataset; it was found by inspecting the evaluation set's labels with no
+held-out split; and on DBLP--ACM the mask binds on 5 of 13{,}080 pairs, so the distinction
+cannot matter there. What the split contributes is the finding that missingness is not one
+signal but two, pointing in opposite directions --- which the current feature vector
+represents identically.
+
+\section{What Changes in the Thesis Narrative}
+
+\textbf{The Amazon--Walmart claim is reduced from accuracy to cost.} The dataset now supports
+one statement: pair-adaptive selection removes 74.8\% of the token cost with no measurable
+change in F1 and a repeatable 0.074 loss of recall. The 0.023 advantage claimed for no
+selection, and the implication that adaptive selection trails there, are both withdrawn.
+
+\textbf{Having two datasets reach different conclusions is the stronger result.} DBLP--ACM
+separates by 0.186 with disjoint ranges; Amazon--Walmart does not separate at all. Together
+they bound where the method applies --- aggressive condensation wins outright where one or
+two attributes can carry the decision, and degrades to a cost saving where the evidence is
+spread across a wide, sparsely populated schema. A report claiming a win on both would be
+harder to defend, not easier.
+
+\textbf{Non-reproducibility of a commercial LLM matcher is a finding in its own right, and
+its mechanism is now identified.} Two identical runs disagree on 5.2\% of pairs and 0.078 F1;
+69{,}087 identical prompts replayed a fortnight later move from 1{,}589 Yes answers to
+3{,}250; and forty consecutive calls to one model slug are served by eleven different
+providers. Any result this pipeline obtains through a hosted model API inherits this, and the
+provider is not recoverable after the fact from a run that did not record it --- as none of
+this project's runs before this week did. Whether related work reports this is not something
+this report has checked, and no claim is made about it. Condensation halves the variance
+(Week 5), which is a second argument for the method that has nothing to do with accuracy.
+
+\section{Limitations Added or Changed This Week}
+
+\textbf{One headline comparison did not survive repetition.} Both headline rows are now
+repeated three times on each dataset. On DBLP--ACM the ordering is stable and the ranges
+disjoint; on Amazon--Walmart the ranges overlap and the sign of the paired test changes
+between draws. Every remaining row --- the whole of Fodors--Zagat, the six other
+Amazon--Walmart configurations, and the rule sweep --- is still a single draw, and the
+Amazon--Walmart spread of 0.078 F1 exceeds the gap between several of those rows. Their
+paired tests are large enough that reversal is improbable (the five-attribute collapse and
+the two-attribute floor are significant past $10^{-19}$), but the F1 levels attached to them
+are not reproducible quantities.
+
+\textbf{The held-out separation has been broken a second time, less defensibly.} Week 5
+recorded that the evidence mask was derived from Amazon--Walmart failures, mitigated by the
+mask having an argument independent of any measurement and being inert on the selection
+dataset. The three-way split of Section~\ref{sec:mask} has neither mitigation: it was read
+directly off this dataset's gold labels. It is reported as mechanism and excluded from the
+default configuration for that reason. Restoring the guarantee needs a third dataset used for
+nothing else.
+
+\textbf{Missingness is still absent from the feature vector.} Section~\ref{sec:mask} shows
+the two kinds of blank carry opposite signal, and the six per-attribute features represent
+them identically. Encoding it was deliberately not attempted: it would be a further design
+choice fitted to the gold labels of the one dataset where the method shows no effect. It is
+deferred to a held-out protocol or a fourth dataset.
+
+\section{Next}
+
+\begin{enumerate}
+\item \textbf{A held-out protocol.} Every design choice in this work --- the selection rule,
+the mask, its three-way split --- was read on the data it is reported over. Fixing choices on
+one half and reporting on the other would strengthen the whole thesis more than any further
+tuning.
+\item \textbf{Provider-conditioned analysis.} With the provider now recorded per call, the
+next repeat experiment can report the answer distribution per provider rather than pooled,
+which would separate how much of the 5.2\% flip rate is routing and how much is sampling
+inside one provider. It also makes pinning a single provider a testable way to buy
+reproducibility, at whatever cost in availability that turns out to carry.
+\item \textbf{Sampler sweep.} All Step 1.5 runs use the \texttt{diversity} profile sampler,
+held fixed so the other variables could be read. Sweeping the five available samplers clears
+a stated limitation and widens rather than narrows the claim.
+\end{enumerate}
+
+\end{document}

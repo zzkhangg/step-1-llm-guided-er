@@ -28,6 +28,34 @@ FEATURE_ORDER = (
     "is_numeric",
 )
 
+# How many attributes to keep once importance has been predicted.
+#
+# "cumulative" keeps attributes until their importance sums past a fixed target. It is
+# the historical default and is kept as the default so existing results stay
+# reproducible, but it is *not* scale-free: importance is normalized to sum to one, so
+# on a wide schema each attribute's share shrinks and a fixed target becomes
+# unreachable. On Amazon-Walmart's 13 attributes the 0.8 target needs 7.7 attributes on
+# average against a max_k of 5, so the cap binds for 100% of pairs and the selector
+# cannot express "this pair needs fewer fields" at all.
+#
+# "ratio" keeps an attribute if it carries at least ratio_lambda times the uniform
+# share 1/n, so the bar adapts to schema width. It fixes the saturation but replaces
+# one tuning problem with another: replaying the logged LLM importance vectors, the
+# lambda that gives the most per-pair variation differs by dataset (~1.0 on
+# Fodors-Zagat, ~0.75 on DBLP-ACM, ~1.5 on Amazon-Walmart), because the policy adapts
+# to schema width but not to how concentrated the importance distribution is.
+#
+# "gap" cuts at the largest drop in the ranked importance profile. It has no threshold
+# to tune and, on the same replay, never saturates on any of the three schemas
+# (0% of pairs at max_k, against 100% for cumulative on Amazon-Walmart) while keeping
+# the widest per-pair spread there. It is the recommended policy for wide schemas.
+#
+# The default stays "cumulative" so previously reported results remain reproducible;
+# the policy is an explicit experimental variable rather than a silent change.
+SELECTION_POLICIES = ("cumulative", "ratio", "gap")
+DEFAULT_SELECTION_POLICY = "cumulative"
+DEFAULT_RATIO_LAMBDA = 1.5
+
 OTHER_ATTRIBUTE_HINTS = (
     "image_url",
     "imageurl",
@@ -90,19 +118,21 @@ def _clean_value(value) -> str:
     return str(value).strip()
 
 
+# Two absent values are not evidence that the records agree, so the similarity features
+# report no evidence rather than perfect agreement. Returning 1.0 there made a shared gap
+# in the schema look like the strongest possible match signal, which on Amazon-Walmart
+# affects 2.7% of feature cells and pushes the transfer model towards keeping attributes
+# that neither record populates. _exact_match already answers 0.0 in this case; these two
+# now agree with it.
 def _token_overlap(a: str, b: str) -> float:
     tokens_a = set(re.findall(r"\w+", a.lower()))
     tokens_b = set(re.findall(r"\w+", b.lower()))
-    if not tokens_a and not tokens_b:
-        return 1.0
     if not tokens_a or not tokens_b:
         return 0.0
     return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
 
 
 def _edit_similarity(a: str, b: str) -> float:
-    if not a and not b:
-        return 1.0
     if not a or not b:
         return 0.0
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
@@ -490,6 +520,51 @@ def _semantic_similarity(a: str, b: str, embedding_model=None) -> float:
     return float(np.clip((sim + 1.0) / 2.0, 0.0, 1.0))
 
 
+def attribute_blankness(record_a, record_b, attributes) -> List[str]:
+    """Label each attribute by which side is missing for this specific pair.
+
+    Three cases, and they do not behave alike:
+
+      both_present  both records carry a value; the attribute can agree or contradict
+      one_sided     exactly one record carries a value
+      both_blank    neither record carries a value
+
+    Measured on the 88,296 Amazon-Walmart candidate pairs against the gold labels, where the
+    base match rate is 1.18%: a one_sided blank is mildly *pro*-match (modelno 1.88%,
+    shortdescr 1.97%, longdescr 2.74%), while both_blank is strongly anti-match (modelno
+    0.11%, longdescr and brand 0.00%). Collapsing the two loses a usable signal in each
+    direction, which is why the mask modes below distinguish them.
+    """
+    out = []
+    for attr in attributes:
+        has_a = bool(_clean_value(record_a.get(attr, "")))
+        has_b = bool(_clean_value(record_b.get(attr, "")))
+        if has_a and has_b:
+            out.append("both_present")
+        elif has_a or has_b:
+            out.append("one_sided")
+        else:
+            out.append("both_blank")
+    return out
+
+
+def attribute_evidence_mask(record_a, record_b, attributes) -> List[bool]:
+    """Mark the attributes that carry evidence for this specific pair.
+
+    An attribute both records populate can support or contradict a match. One that
+    either record leaves empty can do neither: every similarity feature computed on it
+    is zero regardless of what the other record says, so it contributes no signal while
+    still consuming prompt tokens and occupying a selection slot. Selecting such an
+    attribute is the pair-level analogue of scoring two absent values as agreement, and
+    is wrong for the same reason.
+
+    Measured on Amazon-Walmart, 26% of selections contained an attribute absent on one
+    side, and 26 of the 135 matches the selector missed had been condensed to a single
+    such attribute -- the matcher was shown an empty field and asked to decide.
+    """
+    return [k == "both_present" for k in attribute_blankness(record_a, record_b, attributes)]
+
+
 def compute_attribute_features(
     record_a,
     record_b,
@@ -647,7 +722,16 @@ class HybridAttributeSelector:
         required_attribute_roles=None,
         attribute_roles=None,
         threshold=None,
+        selection_policy=DEFAULT_SELECTION_POLICY,
+        ratio_lambda=DEFAULT_RATIO_LAMBDA,
     ):
+        if selection_policy not in SELECTION_POLICIES:
+            raise ValueError(
+                f"Unknown selection_policy {selection_policy!r}; "
+                f"expected one of {sorted(SELECTION_POLICIES)}"
+            )
+        self.selection_policy = selection_policy
+        self.ratio_lambda = float(ratio_lambda)
         self.attributes = list(attributes)
         self.predictor_weight = predictor_weight
         self.retrieval_weight = retrieval_weight
@@ -775,35 +859,88 @@ class HybridAttributeSelector:
             },
         )
 
-    def select_attributes(self, pair_features):
+    def _k_bounds(self, n_attributes):
+        max_k = n_attributes
+        if self.max_k_attributes is not None:
+            max_k = max(1, min(int(self.max_k_attributes), n_attributes))
+        min_k = max(1, min(int(self.min_k_attributes), max_k))
+        return min_k, max_k
+
+    def _select_cumulative(self, combined, ranked_indices):
+        """Keep attributes until their importance sums past the target."""
+        min_k, max_k = self._k_bounds(len(ranked_indices))
+        target = float(self.cumulative_importance_threshold)
+        selected, cumulative = [], 0.0
+        for idx in ranked_indices:
+            if len(selected) >= max_k:
+                break
+            selected.append(idx)
+            cumulative += float(combined[idx])
+            if len(selected) >= min_k and cumulative >= target:
+                break
+        return selected
+
+    def _select_ratio(self, combined, ranked_indices):
+        """Keep attributes carrying at least ratio_lambda times the uniform share.
+
+        Scale-free by construction: the bar is lambda/n, so it tightens as the schema
+        widens instead of becoming unreachable.
+        """
+        min_k, max_k = self._k_bounds(len(ranked_indices))
+        bar = self.ratio_lambda / len(ranked_indices)
+        selected = [idx for idx in ranked_indices if float(combined[idx]) >= bar]
+        if len(selected) < min_k:
+            selected = list(ranked_indices[:min_k])
+        return selected[:max_k]
+
+    def _select_gap(self, combined, ranked_indices):
+        """Cut at the largest drop in the ranked importance profile."""
+        min_k, max_k = self._k_bounds(len(ranked_indices))
+        if max_k <= min_k:
+            return list(ranked_indices[:max_k])
+        ranked_values = np.array([float(combined[idx]) for idx in ranked_indices[:max_k]])
+        gaps = ranked_values[:-1] - ranked_values[1:]
+        cut = int(np.argmax(gaps[min_k - 1:])) + min_k
+        return list(ranked_indices[:cut])
+
+    def select_attributes(self, pair_features, evidence_mask=None):
         combined, predictor_importance, retrieval_importance, retrieval_debug = self.estimate_importance(pair_features)
-        ranked_indices = np.argsort(-combined).tolist()
+
+        # Attributes with no evidence for this pair are removed from consideration before
+        # any rule runs, rather than being ranked low and possibly selected anyway. Two
+        # paths could otherwise select one: a rule that has to fill min_k slots, and
+        # role enforcement, which promotes an "identity" attribute regardless of its
+        # predicted importance. On Amazon-Walmart that promoted an empty modelno.
+        # If nothing carries evidence the mask is ignored, since some subset must still
+        # be sent and the ranking is the only available guidance.
+        usable = np.ones(len(combined), dtype=bool)
+        if evidence_mask is not None:
+            mask = np.asarray(evidence_mask, dtype=bool)
+            if mask.shape == usable.shape and mask.any():
+                usable = mask
+
+        combined = np.where(usable, combined, 0.0)
+        total = float(combined.sum())
+        if total > 0:
+            combined = combined / total
+
+        ranked_indices = [idx for idx in np.argsort(-combined).tolist() if usable[idx]]
 
         if self.top_k_attributes is not None:
             selected_indices = ranked_indices[: int(self.top_k_attributes)]
+        elif self.selection_policy == "ratio":
+            selected_indices = self._select_ratio(combined, ranked_indices)
+        elif self.selection_policy == "gap":
+            selected_indices = self._select_gap(combined, ranked_indices)
         elif self.cumulative_importance_threshold is not None:
-            max_k = len(ranked_indices)
-            if self.max_k_attributes is not None:
-                max_k = max(1, min(int(self.max_k_attributes), len(ranked_indices)))
-            min_k = max(1, min(int(self.min_k_attributes), max_k))
-            target = float(self.cumulative_importance_threshold)
-
-            selected_indices = []
-            cumulative = 0.0
-            for idx in ranked_indices:
-                if len(selected_indices) >= max_k:
-                    break
-                selected_indices.append(idx)
-                cumulative += float(combined[idx])
-                if len(selected_indices) >= min_k and cumulative >= target:
-                    break
+            selected_indices = self._select_cumulative(combined, ranked_indices)
         elif self.threshold is not None:
             selected_indices = [idx for idx in ranked_indices if combined[idx] >= self.threshold]
         else:
             selected_indices = ranked_indices
 
         if not selected_indices:
-            selected_indices = [int(np.argmax(combined))]
+            selected_indices = [ranked_indices[0]] if ranked_indices else [int(np.argmax(combined))]
         selected_indices = self._enforce_required_roles(selected_indices, ranked_indices)
 
         return {

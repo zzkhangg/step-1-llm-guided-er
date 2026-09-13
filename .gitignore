@@ -7,5 +7,7 @@ __pycache__
 *.pkl
 .codex
 logs/
+docs/
 
+CLAUDE.mdcache/embeddings
 CLAUDE.md

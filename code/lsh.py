@@ -1,4 +1,6 @@
 from collections import defaultdict
+from itertools import combinations
+from numbers import Integral
 import numpy as np
 
 
@@ -13,9 +15,26 @@ def create_random_planes(num_tables: int, num_planes: int, dim: int, seed: int =
 def query_lsh_fast(tableA_vectors, tableB_vectors, planes_list, num_flips=1, top_k=5):
     """
     Fast LSH blocking using integer hash keys + dict lookup (no matrix comparison).
+
+    num_flips is the maximum Hamming distance to probe, including the exact
+    bucket. Zero probes only the exact bucket; one preserves the original
+    behaviour. Probe count per table is sum(comb(num_planes, r), r=0..num_flips).
     """
     candidate_pairs = []
     num_planes = planes_list[0].shape[0]
+    if isinstance(num_flips, bool) or not isinstance(num_flips, Integral):
+        raise ValueError("num_flips must be an integer")
+    if not 0 <= num_flips <= num_planes:
+        raise ValueError("num_flips must be between 0 and num_planes")
+    if any(planes.shape[0] != num_planes for planes in planes_list):
+        raise ValueError("All LSH tables must have the same number of planes")
+
+    # Reuse XOR masks for every query and table; include all smaller radii.
+    probe_masks = [
+        sum(1 << bit for bit in flipped_bits)
+        for radius in range(num_flips + 1)
+        for flipped_bits in combinations(range(num_planes), radius)
+    ]
 
     # ── pre-hash all of table B into dicts: {hash_int -> [idx, ...]} ──
     print("Pre-hashing Table B...")
@@ -43,17 +62,8 @@ def query_lsh_fast(tableA_vectors, tableB_vectors, planes_list, num_flips=1, top
             bitsA = (proj > 0).astype(np.uint8)
             h     = int(bitsA @ powers)
 
-            # exact match — O(1) dict lookup
-            if h in buckets:
-                candidates.update(buckets[h])
-
-            # multi-probe — flip each bit
-            for flip_idx in range(num_planes):
-                flipped    = bitsA.copy()
-                flipped[flip_idx] ^= 1
-                h_flipped  = int(flipped @ powers)
-                if h_flipped in buckets:
-                    candidates.update(buckets[h_flipped])
+            for mask in probe_masks:
+                candidates.update(buckets.get(h ^ mask, ()))
 
         if not candidates:
             continue
